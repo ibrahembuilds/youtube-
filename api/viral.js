@@ -1,14 +1,13 @@
-import { setCors, parseBody, callAI } from "./_lib.js";
+import { guard, callAI, validateTranscriptContext } from "./_lib.js";
 
 export default async function handler(req, res) {
-  setCors(res);
-  if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+  const body = await guard(req, res);
+  if (!body) return;
 
-  const body = await parseBody(req);
   const { transcriptContext } = body;
 
-  if (!transcriptContext) return res.status(400).json({ error: "transcriptContext is required" });
+  const contextError = validateTranscriptContext(transcriptContext);
+  if (contextError) return res.status(400).json({ error: contextError });
 
   try {
     const systemPrompt = `You are a viral content strategist who specializes in creating short-form content (Reels, TikTok, YouTube Shorts) from long-form YouTube videos.

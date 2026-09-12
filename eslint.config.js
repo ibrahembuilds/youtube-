@@ -26,9 +26,22 @@ export default tseslint.config(
   },
   {
     files: ["api/**/*.js", "api-server.js", "*.config.js"],
+    extends: [js.configs.recommended],
     languageOptions: {
       ecmaVersion: "latest",
+      sourceType: "module",
       globals: globals.node,
+    },
+  },
+  {
+    // Test scripts run in Node, but page.evaluate() callbacks are serialised
+    // and run inside the browser, so both global sets are legitimate here.
+    files: ["tests/**/*.mjs"],
+    extends: [js.configs.recommended],
+    languageOptions: {
+      ecmaVersion: "latest",
+      sourceType: "module",
+      globals: { ...globals.node, ...globals.browser },
     },
   }
 );

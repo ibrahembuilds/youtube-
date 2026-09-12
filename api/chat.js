@@ -1,15 +1,14 @@
-import { setCors, parseBody, callAI } from "./_lib.js";
+import { guard, callAI, validateTranscriptContext } from "./_lib.js";
 
 export default async function handler(req, res) {
-  setCors(res);
-  if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+  const body = await guard(req, res);
+  if (!body) return;
 
-  const body = await parseBody(req);
   const { messages, transcriptContext } = body;
 
   if (!messages || !Array.isArray(messages)) return res.status(400).json({ error: "messages array is required" });
-  if (!transcriptContext) return res.status(400).json({ error: "transcriptContext is required" });
+  const contextError = validateTranscriptContext(transcriptContext);
+  if (contextError) return res.status(400).json({ error: contextError });
 
   try {
     const systemPrompt = `You are an AI assistant that helps users understand YouTube videos. 

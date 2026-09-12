@@ -1,0 +1,157 @@
+// API contract, CORS and abuse-surface checks.
+// Spawns its own api-server instances so the run is deterministic and does not
+// depend on a dev server already being up.
+import { spawn } from "node:child_process";
+import { group, check, summarise } from "./harness.mjs";
+
+const ALLOWED = "http://localhost:3000"; // api-server.js allows the Vite dev origin
+const HOSTILE = "https://evil.example";
+
+function startServer(port, env = {}) {
+  const child = spawn("node", ["api-server.js"], {
+    env: { ...process.env, API_PORT: String(port), ...env },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return new Promise((resolve, reject) => {
+    let stderr = "";
+    const timer = setTimeout(
+      () => reject(new Error(`server on :${port} did not start\n${stderr.trim()}`)),
+      15000
+    );
+    child.stderr.on("data", (d) => (stderr += d));
+    child.stdout.on("data", (d) => {
+      if (d.toString().includes("API dev server running")) {
+        clearTimeout(timer);
+        resolve(child);
+      }
+    });
+    child.on("error", reject);
+  });
+}
+
+async function post(port, route, body, headers = {}) {
+  const res = await fetch(`http://localhost:${port}/api/${route}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...headers },
+    body: typeof body === "string" ? body : JSON.stringify(body),
+    signal: AbortSignal.timeout(60000),
+  });
+  const text = await res.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch { /* non-json response */ }
+  return { status: res.status, headers: res.headers, text, json };
+}
+
+const PORT = 3101;
+const server = await startServer(PORT, { RATE_LIMIT_MAX: "1000" });
+
+try {
+  group("Method and validation contract");
+  {
+    const get = await fetch(`http://localhost:${PORT}/api/transcript`, { method: "GET" });
+    check("GET is rejected with 405", get.status === 405, `got ${get.status}`);
+
+    const opts = await fetch(`http://localhost:${PORT}/api/transcript`, {
+      method: "OPTIONS", headers: { Origin: ALLOWED },
+    });
+    check("OPTIONS preflight returns 204", opts.status === 204, `got ${opts.status}`);
+
+    const cases = [
+      ["transcript", {}, "videoId is required"],
+      ["download", {}, "videoId is required"],
+      ["chat", {}, "messages array is required"],
+      ["chat", { messages: [] }, "transcriptContext is required"],
+      ["summary", {}, "transcriptContext is required"],
+      ["viral", {}, "transcriptContext is required"],
+      ["translate", {}, "segments array is required"],
+      ["translate", { segments: [{ text: "hi" }] }, "targetLanguage is required"],
+    ];
+    for (const [route, body, expected] of cases) {
+      const r = await post(PORT, route, body);
+      check(`POST /${route} ${JSON.stringify(body)} -> 400`,
+        r.status === 400 && String(r.json?.error).includes(expected.split(" ")[0]),
+        `got ${r.status} ${r.text.slice(0, 90)}`);
+    }
+  }
+
+  group("F02 — SSRF endpoint is gone");
+  {
+    const r = await post(PORT, "transcript-content", { url: "https://example.com/" });
+    check("/api/transcript-content is not routed", r.status === 404,
+      `got ${r.status} — an endpoint that fetches an arbitrary url server-side must not exist`);
+    check("it cannot be used to read internal services", !String(r.text).includes("Example Domain"),
+      `response leaked remote content: ${r.text.slice(0, 90)}`);
+  }
+
+  group("F03 — CORS is not a wildcard");
+  {
+    const allowed = await post(PORT, "transcript", {}, { Origin: ALLOWED });
+    check("allow-listed origin is echoed back",
+      allowed.headers.get("access-control-allow-origin") === ALLOWED,
+      `got ${allowed.headers.get("access-control-allow-origin")}`);
+    check("response varies on Origin", (allowed.headers.get("vary") || "").includes("Origin"),
+      `got ${allowed.headers.get("vary")}`);
+
+    const hostile = await post(PORT, "chat", {}, { Origin: HOSTILE });
+    check("unknown origin is refused with 403", hostile.status === 403, `got ${hostile.status}`);
+    check("unknown origin gets no ACAO header",
+      hostile.headers.get("access-control-allow-origin") === null,
+      `got ${hostile.headers.get("access-control-allow-origin")}`);
+    check("no endpoint answers with ACAO: *",
+      hostile.headers.get("access-control-allow-origin") !== "*", "wildcard CORS is back");
+  }
+
+  group("F03 — payload caps");
+  {
+    const big = await post(PORT, "summary", { transcriptContext: "x".repeat(70000), type: "brief" });
+    check("oversized transcriptContext is refused", big.status === 400,
+      `got ${big.status} ${big.text.slice(0, 90)}`);
+
+    const bigBody = await post(PORT, "chat", "x".repeat(600 * 1024));
+    check("oversized request body is refused", bigBody.status === 413 || bigBody.status === 400,
+      `got ${bigBody.status} ${bigBody.text.slice(0, 90)}`);
+
+    const bigSegs = await post(PORT, "translate", {
+      segments: [{ text: "y".repeat(70000), start: 0, duration: 1 }],
+      targetLanguage: "Spanish",
+    });
+    check("oversized translate payload is refused", bigSegs.status === 400,
+      `got ${bigSegs.status} ${bigSegs.text.slice(0, 90)}`);
+  }
+
+  group("Live YouTube path (network-dependent)");
+  {
+    const r = await post(PORT, "transcript", { videoId: "dQw4w9WgXcQ" });
+    if (r.status === 200) {
+      check("returns caption tracks with urls",
+        Array.isArray(r.json?.tracks) && r.json.tracks.length > 0 && !!r.json.tracks[0].transcriptUrl,
+        JSON.stringify(r.json).slice(0, 120));
+    } else {
+      check("throttled response is distinguishable from 'no captions'", false,
+        `YouTube returned non-200 and the handler collapsed it into a generic message: ${r.text.slice(0, 120)}`,
+        "F08");
+    }
+  }
+} finally {
+  server.kill();
+}
+
+group("F03 — per-IP rate limiting");
+{
+  const RL_PORT = 3102;
+  const rlServer = await startServer(RL_PORT, { RATE_LIMIT_MAX: "3", RATE_LIMIT_WINDOW_MS: "60000" });
+  try {
+    const codes = [];
+    for (let i = 0; i < 5; i++) codes.push((await post(RL_PORT, "transcript", {})).status);
+    check("requests beyond the cap get 429", codes.filter((c) => c === 429).length === 2,
+      `statuses = ${JSON.stringify(codes)} (cap 3)`);
+
+    const limited = await post(RL_PORT, "transcript", {});
+    check("429 carries a Retry-After header", !!limited.headers.get("retry-after"),
+      `got ${limited.headers.get("retry-after")}`);
+  } finally {
+    rlServer.kill();
+  }
+}
+
+summarise("API");

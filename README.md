@@ -28,6 +28,33 @@ Paste a YouTube link. Watch, chat, summarize, and create viral shorts from any v
 
 `npm run dev` reads `.env` via `api-server.js` (a local stand-in for Vercel's serverless functions, used only in development). In production on Vercel, the files in `api/` run as real serverless functions instead.
 
+### Environment variables
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `OPENROUTER_API_KEY` | yes | Powers chat, summaries, viral shorts and translation. |
+| `ALLOWED_ORIGINS` | no | Extra browser origins allowed to call `/api/*`. Same-origin is always allowed. |
+| `RATE_LIMIT_MAX` | no | Per-IP requests per window (default 20). |
+| `RATE_LIMIT_WINDOW_MS` | no | Window length in ms (default 60000). |
+
+The rate-limit counter lives in each serverless instance's memory, so the real
+ceiling is `warm instances x RATE_LIMIT_MAX`. Use a shared store (Redis/Upstash)
+if you need a hard cap.
+
+## Tests
+
+```bash
+npm test            # units + api + e2e
+npm run test:unit   # caption parsers, imported from src/
+npm run test:api    # /api contract, CORS, rate limits — spawns its own server
+npm run test:e2e    # real Chromium against a production build
+```
+
+The E2E suite runs against a production build served through the rewrite rules
+in this repo's own `vercel.json`, because dev and production route
+`/yt-timedtext` differently and that gap is where transcript bugs hide. See
+[`tests/README.md`](tests/README.md) for the known-issue tagging scheme.
+
 ## License
 
 MIT

@@ -50,10 +50,14 @@ export async function fetchTranscriptMeta(videoId: string): Promise<TranscriptRe
 }
 
 // ─── Client-side transcript fetching ──────────────────────────────────
-// YouTube's timedtext API blocks cross-origin (CORS) from browsers AND
-// blocks serverless IPs from servers. Strategy for dev + prod:
-//   Dev:  Vite proxies /yt-timedtext?<params> → YouTube (user's real IP)
-//   Prod: CORS proxy fallback
+// Captions must be fetched from the BROWSER, not the server: YouTube's signed
+// caption URLs return HTTP 200 with an empty body to datacenter IPs (verified
+// against a live signed URL), so anything running on Vercel gets nothing back.
+//
+// Order matters. The direct fetch goes first because YouTube's timedtext API
+// does send CORS headers, and a direct fetch uses the viewer's own IP — which
+// YouTube throttles far less aggressively than a datacenter one. The
+// same-origin proxy is the fallback, then a public CORS proxy as last resort.
 
 /** Build a same-origin proxy URL for YouTube's timedtext API. */
 function makeProxyUrl(transcriptUrl: string): string {
@@ -64,73 +68,63 @@ function makeProxyUrl(transcriptUrl: string): string {
   return `/yt-timedtext${query}`;
 }
 
-const CORS_FALLBACKS = [
-  (url: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-];
+const FETCH_TIMEOUT_MS = 8000;
+
+/**
+ * Fetch a URL as text. Throws on a non-2xx status, an empty body, or a
+ * timeout — so a caller can tell "this source failed" from "this source
+ * returned something usable".
+ */
+async function fetchText(url: string): Promise<string> {
+  const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const text = await res.text();
+  if (!text.trim()) throw new Error("empty body");
+  return text;
+}
 
 /** Fetch and parse a single transcript track from the browser. */
 export async function fetchTranscriptContent(
   track: TranscriptTrack
 ): Promise<TranscriptSegment[]> {
-  let lastError: Error | null = null;
+  const sources: { label: string; load: () => Promise<TranscriptSegment[]> }[] = [
+    {
+      label: "direct",
+      load: async () => parseTranscriptXml(await fetchText(track.transcriptUrl)),
+    },
+    {
+      label: "direct-json3",
+      load: async () => parseTranscriptJson3(await fetchText(track.transcriptUrl + "&fmt=json3")),
+    },
+    {
+      label: "same-origin-proxy",
+      load: async () => parseTranscriptXml(await fetchText(makeProxyUrl(track.transcriptUrl))),
+    },
+    {
+      label: "cors-proxy",
+      load: async () =>
+        parseTranscriptXml(
+          await fetchText(`https://api.allorigins.win/raw?url=${encodeURIComponent(track.transcriptUrl)}`)
+        ),
+    },
+  ];
 
-  // Try 1: Same-origin via Vite proxy (works in dev mode from user's IP)
-  try {
-    const proxyUrl = makeProxyUrl(track.transcriptUrl);
-    const res = await fetch(proxyUrl);
-    if (res.ok) {
-      const xml = await res.text();
-      if (xml && xml.trim().length > 0) {
-        return parseTranscriptXml(xml);
-      }
-    }
-  } catch {
-    // proxy not available (production) — continue
-  }
+  const failures: string[] = [];
 
-  // Try 2: Direct fetch (works with some browser extensions)
-  try {
-    const res = await fetch(track.transcriptUrl);
-    if (res.ok) {
-      const xml = await res.text();
-      if (xml && xml.trim().length > 0) {
-        return parseTranscriptXml(xml);
-      }
-    }
-  } catch (e) {
-    lastError = e as Error;
-  }
-
-  // Try 3: Direct with JSON3 format  
-  try {
-    const res = await fetch(track.transcriptUrl + "&fmt=json3");
-    if (res.ok) {
-      const text = await res.text();
-      if (text && text.trim().length > 0) {
-        return parseTranscriptJson3(text);
-      }
-    }
-  } catch {
-    // continue
-  }
-
-  // Try 4: CORS proxy fallback
-  for (const makeUrl of CORS_FALLBACKS) {
+  for (const source of sources) {
     try {
-      const url = makeUrl(track.transcriptUrl);
-      const res = await fetch(url);
-      if (res.ok) {
-        const xml = await res.text();
-        if (xml && xml.trim().length > 0) {
-          return parseTranscriptXml(xml);
-        }
-      }
-    } catch {
-      // try next
+      const segments = await source.load();
+      // A 200 response is not success. Any same-origin path that is not
+      // wired up returns the SPA's own index.html with HTTP 200, which
+      // parses cleanly to zero segments — so only a non-empty parse counts.
+      if (segments.length > 0) return segments;
+      failures.push(`${source.label}: parsed 0 segments`);
+    } catch (err) {
+      failures.push(`${source.label}: ${(err as Error).message}`);
     }
   }
 
-  throw lastError || new Error("All transcript fetch methods failed");
+  throw new Error(`Could not load captions for ${track.languageName} — ${failures.join("; ")}`);
 }
 
 /** Fetch transcript content for ALL tracks in parallel from the browser. */
@@ -149,7 +143,7 @@ export async function fetchAllTranscriptContent(
 }
 
 /** Parse YouTube's XML transcript format into segments. */
-function parseTranscriptXml(xml: string): TranscriptSegment[] {
+export function parseTranscriptXml(xml: string): TranscriptSegment[] {
   const segments: TranscriptSegment[] = [];
   const regex = /<text start="([\d.]+)" dur="([\d.]+)"[^>]*>(.*?)<\/text>/g;
   let match;
@@ -176,7 +170,7 @@ function parseTranscriptXml(xml: string): TranscriptSegment[] {
 }
 
 /** Parse YouTube's JSON3 transcript format (fmt=json3). */
-function parseTranscriptJson3(json: string): TranscriptSegment[] {
+export function parseTranscriptJson3(json: string): TranscriptSegment[] {
   const segments: TranscriptSegment[] = [];
   try {
     const data = JSON.parse(json);
