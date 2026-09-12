@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { Play, Sparkles, MessageCircle, Download, Scissors, Loader2, Send, FileText, List, CheckCircle, Clock, Globe, Languages } from "lucide-react";
 import { extractVideoId, getEmbedUrl, getThumbnail, fetchVideoInfo, type VideoInfo } from "@/lib/youtube";
@@ -12,12 +12,47 @@ import {
 
 type Tab = "watch" | "transcript" | "chat" | "summary" | "viral" | "download";
 
-const SUPPORTED_LANGUAGES = [
-  "Arabic", "Chinese (Simplified)", "Chinese (Traditional)", "Dutch",
-  "English", "French", "German", "Hindi", "Indonesian", "Italian",
-  "Japanese", "Korean", "Malay", "Portuguese", "Russian", "Spanish",
-  "Thai", "Turkish", "Vietnamese",
+// Paired with a language code, because the only reliable way to tell "this is
+// already the transcript's language" is to compare codes. A track's display
+// name carries qualifiers ("Portuguese (Brazil)", "English (auto-generated)")
+// that never match a plain list entry.
+const SUPPORTED_LANGUAGES: { name: string; code: string }[] = [
+  { name: "Arabic", code: "ar" },
+  { name: "Chinese (Simplified)", code: "zh" },
+  { name: "Chinese (Traditional)", code: "zh" },
+  { name: "Dutch", code: "nl" },
+  { name: "English", code: "en" },
+  { name: "French", code: "fr" },
+  { name: "German", code: "de" },
+  { name: "Hindi", code: "hi" },
+  { name: "Indonesian", code: "id" },
+  { name: "Italian", code: "it" },
+  { name: "Japanese", code: "ja" },
+  { name: "Korean", code: "ko" },
+  { name: "Malay", code: "ms" },
+  { name: "Portuguese", code: "pt" },
+  { name: "Russian", code: "ru" },
+  { name: "Spanish", code: "es" },
+  { name: "Thai", code: "th" },
+  { name: "Turkish", code: "tr" },
+  { name: "Vietnamese", code: "vi" },
 ];
+
+/** Base language code, so "pt-BR" and "pt" compare equal. */
+function baseCode(code: string | undefined): string {
+  return (code || "").toLowerCase().split(/[-_]/)[0];
+}
+
+/** The language the viewer most likely wants, that is not the transcript's own. */
+function defaultTargetLanguage(trackCode: string | undefined): string {
+  const track = baseCode(trackCode);
+  const preferred = typeof navigator !== "undefined" ? navigator.languages || [navigator.language] : [];
+  for (const tag of preferred) {
+    const hit = SUPPORTED_LANGUAGES.find((l) => l.code === baseCode(tag));
+    if (hit && hit.code !== track) return hit.name;
+  }
+  return (SUPPORTED_LANGUAGES.find((l) => l.code !== track) || SUPPORTED_LANGUAGES[0]).name;
+}
 
 export default function Studio() {
   const [url, setUrl] = useState("");
@@ -59,6 +94,25 @@ export default function Studio() {
   const selectedSegments = trackSegments.get(selectedTrackIndex) || [];
   const selectedTrack = transcriptMeta?.tracks?.[selectedTrackIndex] ?? null;
   const transcriptText = formatTranscriptText(selectedSegments);
+
+  const trackCode = selectedTrack?.languageCode;
+
+  // Translating a transcript into its own language is a no-op, and the button
+  // for it is disabled. Defaulting the dropdown to "English" therefore left the
+  // whole feature dead on arrival for every English video — which is most of
+  // them. Move off the transcript's own language as soon as it is known.
+  useEffect(() => {
+    if (!trackCode) return;
+    setTargetLanguage((current) => {
+      const currentCode = SUPPORTED_LANGUAGES.find((l) => l.name === current)?.code;
+      return currentCode === baseCode(trackCode) ? defaultTargetLanguage(trackCode) : current;
+    });
+  }, [trackCode]);
+
+  const targetIsSameLanguage = useMemo(() => {
+    const targetCode = SUPPORTED_LANGUAGES.find((l) => l.name === targetLanguage)?.code;
+    return !!targetCode && targetCode === baseCode(trackCode);
+  }, [targetLanguage, trackCode]);
 
   async function handleLoad() {
     setError("");
@@ -348,6 +402,7 @@ export default function Studio() {
                   setTargetLanguage={setTargetLanguage}
                   onTranslate={handleTranslate}
                   translating={translating}
+                  targetIsSameLanguage={targetIsSameLanguage}
                   onClearTranslation={() => setTranslatedText("")}
                 />
               )}
@@ -416,11 +471,13 @@ function WatchTab({ videoId, videoInfo, selectedTrack, segmentCount }: {
 }
 
 function TranscriptTab({
-  segments, track, loading, translatedText, targetLanguage, setTargetLanguage, onTranslate, translating, onClearTranslation,
+  segments, track, loading, translatedText, targetLanguage, setTargetLanguage, onTranslate, translating,
+  onClearTranslation, targetIsSameLanguage,
 }: {
   segments: TranscriptSegment[]; track: TranscriptTrack | null; loading: boolean;
   translatedText: string; targetLanguage: string; setTargetLanguage: (v: string) => void;
   onTranslate: () => void; translating: boolean; onClearTranslation: () => void;
+  targetIsSameLanguage: boolean;
 }) {
   if (loading) {
     return (
@@ -458,12 +515,28 @@ function TranscriptTab({
             <span className="text-sm font-medium">{track.languageName}{track.kind === "asr" && <span className="text-ink-400 font-normal ml-1">(auto-generated)</span>}</span>
             <span className="text-xs text-ink-400">• {segments.length} segments</span>
           </div>
-          <div className="flex items-center gap-2 ml-auto">
-            <span className="text-sm text-ink-400 flex items-center gap-1"><Languages className="w-3.5 h-3.5" />Translate to:</span>
-            <select value={targetLanguage} onChange={(e) => setTargetLanguage(e.target.value)} className="text-sm border border-ink-200 rounded-lg px-2 py-1.5 bg-white">
-              {SUPPORTED_LANGUAGES.map((lang) => <option key={lang} value={lang}>{lang}</option>)}
+          {/* Wraps at phone width — unwrapped, this row pushed the Translate
+              button 10px past a 390px viewport, where it could not be tapped. */}
+          <div className="flex items-center gap-2 flex-wrap w-full sm:w-auto sm:ml-auto">
+            <span className="text-sm text-ink-400 flex items-center gap-1">
+              <Languages className="w-3.5 h-3.5" />Translate to:
+            </span>
+            <select
+              id="translate-target"
+              value={targetLanguage}
+              onChange={(e) => setTargetLanguage(e.target.value)}
+              className="text-sm border border-ink-200 rounded-lg px-2 py-1.5 bg-white min-w-0 flex-1 sm:flex-none"
+            >
+              {SUPPORTED_LANGUAGES.map((lang) => (
+                <option key={lang.name} value={lang.name}>{lang.name}</option>
+              ))}
             </select>
-            <button onClick={onTranslate} disabled={translating || targetLanguage === track.languageName} className="btn-primary text-xs py-1.5 px-3">
+            <button
+              onClick={onTranslate}
+              disabled={translating || targetIsSameLanguage}
+              title={targetIsSameLanguage ? `This transcript is already in ${targetLanguage}` : undefined}
+              className="btn-primary text-xs py-1.5 px-3 whitespace-nowrap"
+            >
               {translating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : "Translate"}
             </button>
           </div>

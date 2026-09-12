@@ -31,7 +31,11 @@ export function resolveRewrite(pathname, rewrites = loadRewrites()) {
   return { destination: pathname, external: false };
 }
 
-export function startProdServer({ port = 4173, apiPort = 3001 } = {}) {
+/**
+ * `apiOrigin` proxies /api/* to a remote deployment instead of a local port,
+ * so the real UI can be driven against the real online backend.
+ */
+export function startProdServer({ port = 4173, apiPort = 3001, apiOrigin = null } = {}) {
   const rewrites = loadRewrites();
 
   const serveFile = (res, file) => {
@@ -64,6 +68,32 @@ export function startProdServer({ port = 4173, apiPort = 3001 } = {}) {
     }
 
     if (hit.destination.startsWith("/api/")) {
+      if (apiOrigin) {
+        // fetch() honours the environment's proxy settings; http/https.request
+        // does not, so use fetch for the remote hop.
+        (async () => {
+          const chunks = [];
+          for await (const c of req) chunks.push(c);
+          const body = chunks.length ? Buffer.concat(chunks) : undefined;
+          try {
+            const upstream = await fetch(new URL(hit.destination + search, apiOrigin), {
+              method: req.method,
+              headers: { "Content-Type": req.headers["content-type"] || "application/json" },
+              body,
+              signal: AbortSignal.timeout(180000),
+            });
+            const text = await upstream.text();
+            res.writeHead(upstream.status, {
+              "Content-Type": upstream.headers.get("content-type") || "application/json",
+            });
+            res.end(text);
+          } catch (e) {
+            res.writeHead(502, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: `upstream unreachable: ${e.message}` }));
+          }
+        })();
+        return;
+      }
       const proxy = http.request(
         { host: "localhost", port: apiPort, path: hit.destination + search, method: req.method, headers: req.headers },
         (upstream) => {
