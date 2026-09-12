@@ -6,7 +6,9 @@ import {
   parseTranscriptJson3,
   formatTranscriptText,
 } from "../src/lib/ai.ts";
-import { extractJsonObject, normaliseShorts } from "../api/viral.js";
+import {
+  extractJsonObject, normaliseShorts, MIN_CLIP_SECONDS, MAX_CLIP_SECONDS,
+} from "../api/viral.js";
 import { classifyWatchPage } from "../api/_lib.js";
 
 group("XML caption parsing");
@@ -102,8 +104,9 @@ group("Viral shorts — surviving a cheaper model's output");
     extractJsonObject("I could not find any good clips.") === null);
 
   const messy = normaliseShorts({ shorts: [
-    { title: "Good", script: "S", viralScore: "150", startTime: "12.5", captions: "not-an-array", hashtags: ["#a", 7] },
-    { title: "Missing script" },
+    { title: "Good", script: "S", viralScore: "150", startTime: "12.5", endTime: "42.5",
+      captions: "not-an-array", hashtags: ["#a", 7] },
+    { title: "Missing script", startTime: 0, endTime: 30 },
     null,
   ]});
   check("drops entries the UI cannot render", messy.length === 1, `kept ${messy.length}`);
@@ -112,6 +115,41 @@ group("Viral shorts — surviving a cheaper model's output");
   check("forces captions/hashtags to clean arrays",
     Array.isArray(messy[0].captions) && messy[0].captions.length === 0 && messy[0].hashtags.length === 1,
     JSON.stringify({ c: messy[0].captions, h: messy[0].hashtags }));
+}
+
+group("Viral clip durations must be usable as Shorts");
+{
+  // Measured against the live endpoint before this was constrained: a real
+  // 30-minute transcript produced clips of 4, 4, 4, 4, 4 seconds, and a short
+  // transcript produced one of 112 seconds. Neither is a publishable Short.
+  const clip = (startTime, endTime) => ({ title: "T", script: "S", startTime, endTime });
+
+  const kept = normaliseShorts({ shorts: [
+    clip(0, 4),      // the 4-second case seen live
+    clip(10, 40),    // good
+    clip(60, 105),   // good
+    clip(190, 302),  // the 112-second case seen live
+  ]});
+  check("drops clips too short to publish",
+    !kept.some((c) => c.endTime - c.startTime < MIN_CLIP_SECONDS),
+    `kept spans: ${JSON.stringify(kept.map((c) => c.endTime - c.startTime))}`);
+  check("drops clips too long for short-form",
+    !kept.some((c) => c.endTime - c.startTime > MAX_CLIP_SECONDS),
+    `kept spans: ${JSON.stringify(kept.map((c) => c.endTime - c.startTime))}`);
+  check("keeps the usable ones", kept.length === 2,
+    `kept ${kept.length}: ${JSON.stringify(kept.map((c) => `${c.startTime}-${c.endTime}`))}`);
+
+  check("a boundary-length clip is kept",
+    normaliseShorts({ shorts: [clip(0, MIN_CLIP_SECONDS)] }).length === 1,
+    "the limit itself must not be excluded");
+
+  check("all-unusable input yields nothing, so the handler can say so",
+    normaliseShorts({ shorts: [clip(0, 3), clip(10, 14)] }).length === 0);
+
+  check("the prompt states the duration requirement",
+    /between 20 and 60 seconds/.test(
+      (await import("node:fs")).readFileSync("api/viral.js", "utf8")),
+    "validation alone just drops clips — the model has to be told the target");
 }
 
 group("Model configuration");

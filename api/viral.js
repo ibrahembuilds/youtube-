@@ -46,6 +46,13 @@ export function extractJsonObject(raw) {
   return null;
 }
 
+// Short-form platforms cap out around a minute, and nothing under ~10 seconds
+// is a publishable clip. Measured against the live endpoint, the model returned
+// 4-second clips on a long transcript and a 112-second one on a short
+// transcript when the prompt said nothing about duration.
+export const MIN_CLIP_SECONDS = 10;
+export const MAX_CLIP_SECONDS = 90;
+
 /** Keep only entries that have the fields the UI actually renders. */
 export function normaliseShorts(parsed) {
   const list = Array.isArray(parsed?.shorts) ? parsed.shorts : [];
@@ -62,7 +69,11 @@ export function normaliseShorts(parsed) {
       thumbnailSuggestion: typeof s.thumbnailSuggestion === "string" ? s.thumbnailSuggestion : "",
       viralScore: Number.isFinite(+s.viralScore) ? Math.max(0, Math.min(100, +s.viralScore)) : 0,
       reason: typeof s.reason === "string" ? s.reason : "",
-    }));
+    }))
+    .filter((s) => {
+      const span = s.endTime - s.startTime;
+      return span >= MIN_CLIP_SECONDS && span <= MAX_CLIP_SECONDS;
+    });
 }
 
 export default async function handler(req, res) {
@@ -81,7 +92,11 @@ Analyze the transcript and identify 3-5 moments that would make the best viral s
 
 1. A scroll-stopping title (max 60 chars)
 2. A compelling hook (the first 3 seconds of the short)
-3. Start time and end time in SECONDS as numbers, taken from the transcript timestamps
+3. Start time and end time in SECONDS as numbers, taken from the transcript timestamps.
+   CRITICAL: each clip must run between 20 and 60 seconds (endTime - startTime).
+   That is the format's limit — Reels, TikTok and Shorts need a complete beat,
+   not a single sentence. A 5-second clip is unusable, and so is a 2-minute one.
+   Span several consecutive transcript lines to reach a real 20-60 second moment.
 4. A script for the short (adapted from the transcript, optimized for short-form)
 5. On-screen captions (array of short text overlays)
 6. Hashtags (5-10 relevant hashtags)
@@ -107,7 +122,10 @@ Respond with a JSON object in exactly this shape:
   ]
 }
 
-Write the content in the same language as the transcript.`;
+Write the content in the same language as the transcript.
+
+Before returning, check every clip: if endTime - startTime is under 20 or over
+60, widen or tighten the window until it fits.`;
 
     const messages = [
       { role: "system", content: systemPrompt },
@@ -135,7 +153,8 @@ Write the content in the same language as the transcript.`;
     const shorts = normaliseShorts(parsed);
     if (shorts.length === 0) {
       return res.status(502).json({
-        error: "The AI could not find usable clips in this transcript. Try a longer video.",
+        error:
+          "The AI did not return any clips of a usable length for short-form video. Please try again.",
       });
     }
 
