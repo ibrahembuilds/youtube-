@@ -119,6 +119,21 @@ try {
       `got ${bigSegs.status} ${bigSegs.text.slice(0, 90)}`);
   }
 
+  group("F12 — download endpoint shape");
+  {
+    const r = await post(PORT, "download", { videoId: "dQw4w9WgXcQ" });
+    check("returns 200 with the video url", r.status === 200 && typeof r.json?.videoUrl === "string",
+      `got ${r.status} ${r.text.slice(0, 120)}`);
+    check("no option claims a media format",
+      !(r.json?.options || []).some((o) => /\b(MP4|MP3|WEBM|M4A)\b/i.test(o.label)),
+      JSON.stringify((r.json?.options || []).map((o) => o.label)));
+    const urls = (r.json?.options || []).map((o) => o.url);
+    check("options point at distinct destinations", new Set(urls).size === urls.length,
+      JSON.stringify(urls));
+    const bad = await post(PORT, "download", { videoId: "nope" });
+    check("rejects a malformed video id", bad.status === 400, `got ${bad.status}`);
+  }
+
   group("F08 — caption lookup failures are distinguishable");
   {
     const bad = await post(PORT, "transcript", { videoId: "not-an-id" });

@@ -295,18 +295,40 @@ try {
       "input is shown but Send is a silent no-op — the gate tests selectedTrack, handleChat tests transcriptText", "F11");
     await ctx.close();
   }
+
+  group("F12 — the Download tab does not promise files it cannot deliver");
   {
     const { ctx, page } = await newPage({ sources: { direct: XML } });
     await loadVideo(page);
     await page.click("button:has-text('Download')");
-    await page.waitForTimeout(5000);
+    await page.waitForTimeout(4000);
+
     const links = await page.locator("a[target='_blank']").evaluateAll((els) =>
-      els.map((e) => ({ href: e.href, label: e.querySelector("p")?.textContent })));
-    const mp4 = links.find((l) => /MP4/.test(l.label || ""));
-    const mp3 = links.find((l) => /MP3/.test(l.label || ""));
-    check("video and audio downloads are distinct destinations",
-      !!mp4 && !!mp3 && mp4.href !== mp3.href,
-      `both point at ${mp4?.href} — neither downloads anything`, "F12");
+      els.map((e) => ({ href: e.href, label: e.querySelector("p")?.textContent || "" })));
+
+    // YouTube signs and ciphers its media URLs, so nothing here can hand the
+    // user a file. Labelling a link "Video (MP4)" when it opens a homepage is
+    // the bug — two links that both went to cobalt.tools/ used to claim MP4
+    // and MP3.
+    const fileFormatClaims = links.filter((l) => /\b(MP4|MP3|WEBM|M4A)\b/i.test(l.label));
+    check("no link claims a file format it cannot produce",
+      fileFormatClaims.length === 0,
+      `claiming: ${JSON.stringify(fileFormatClaims.map((l) => l.label))}`);
+
+    const hrefs = links.map((l) => l.href);
+    check("no two options point at the same place",
+      new Set(hrefs).size === hrefs.length, JSON.stringify(hrefs));
+
+    check("the video link is shown so it can be pasted into the tool",
+      (await page.locator("#download-video-url").inputValue()).includes("TEST1234567"),
+      "the external tool needs the url, so the app must surface it");
+
+    check("there is a copy button for it",
+      (await page.locator("button:has-text('Copy')").count()) > 0);
+
+    check("the limitation is stated plainly",
+      (await page.locator("text=cannot download the file itself").count()) > 0,
+      "the user should not be left wondering why no file arrived");
     await ctx.close();
   }
 

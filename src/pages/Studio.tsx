@@ -588,24 +588,84 @@ function ViralTab({ shorts, loading, onRegenerate }: { shorts: ViralShort[]; loa
 }
 
 function DownloadTab({ info, loading }: { info: DownloadInfo | null; loading: boolean }) {
-  if (loading) return <div className="flex items-center gap-3 text-ink-400"><Loader2 className="w-5 h-5 animate-spin" /><span className="text-sm">Getting download options...</span></div>;
+  const [copied, setCopied] = useState(false);
+
+  if (loading) {
+    return (
+      <div className="flex items-center gap-3 text-ink-400">
+        <Loader2 className="w-5 h-5 animate-spin" />
+        <span className="text-sm">Getting download options...</span>
+      </div>
+    );
+  }
   if (!info) return null;
+
+  async function copyLink() {
+    try {
+      await navigator.clipboard.writeText(info!.videoUrl);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      setCopied(false);
+    }
+  }
+
   return (
     <div className="max-w-2xl">
+      {/* The download tools below need the video link pasted in, so make
+          copying it one click instead of asking the user to retype it. */}
+      <div className="card p-4 mb-4">
+        <p className="text-xs font-medium text-ink-400 mb-2">VIDEO LINK</p>
+        <div className="flex items-center gap-2">
+          <input
+            id="download-video-url"
+            readOnly
+            value={info.videoUrl}
+            onFocus={(e) => e.currentTarget.select()}
+            className="input flex-1 font-mono text-xs"
+          />
+          <button onClick={copyLink} className="btn-secondary text-xs whitespace-nowrap">
+            {copied ? "Copied" : "Copy"}
+          </button>
+        </div>
+      </div>
+
       <div className="space-y-3">
         {info.options?.map((opt, i) => (
-          <a key={i} href={opt.url} target="_blank" rel="noopener noreferrer" className="card p-4 flex items-center justify-between hover:border-ink-300 transition-colors group">
+          <a
+            key={i}
+            href={opt.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="card p-4 flex items-center justify-between hover:border-ink-300 transition-colors group"
+          >
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 rounded-lg bg-ink-100 flex items-center justify-center">
-                {opt.type === "audio" ? <Sparkles className="w-5 h-5 text-ink-600" /> : opt.type === "external" ? <Play className="w-5 h-5 text-ink-600" /> : <Download className="w-5 h-5 text-ink-600" />}
+                {opt.type === "external" ? (
+                  <Play className="w-5 h-5 text-ink-600" />
+                ) : (
+                  <Download className="w-5 h-5 text-ink-600" />
+                )}
               </div>
-              <div><p className="font-medium text-sm">{opt.label}</p><p className="text-xs text-ink-400">{opt.desc}</p></div>
+              <div>
+                <p className="font-medium text-sm">{opt.label}</p>
+                <p className="text-xs text-ink-400">{opt.desc}</p>
+              </div>
             </div>
-            <span className="text-ink-400 group-hover:text-ink-600 transition-colors">→</span>
+            <span className="text-ink-400 group-hover:text-ink-600 transition-colors">↗</span>
           </a>
         ))}
       </div>
-      <div className="mt-6 p-4 bg-ink-50 rounded-xl"><p className="text-xs text-ink-400">💡 For educational use only — respect YouTube's Terms of Service and creator copyright.</p></div>
+
+      <div className="mt-6 p-4 bg-ink-50 rounded-xl space-y-2">
+        <p className="text-xs text-ink-500">
+          YT Studio cannot download the file itself — YouTube signs and encrypts its
+          media URLs, so the download has to happen in a dedicated tool.
+        </p>
+        <p className="text-xs text-ink-400">
+          💡 For educational use only — respect YouTube's Terms of Service and creator copyright.
+        </p>
+      </div>
     </div>
   );
 }

@@ -327,7 +327,12 @@ export async function getDownloadInfo(videoId: string): Promise<DownloadInfo> {
 }
 
 export interface DownloadInfo {
-  title: string;
   videoId: string;
-  options: { label: string; desc: string; url: string; type: "video" | "audio" | "external" }[];
+  videoUrl: string;
+  options: {
+    label: string;
+    desc: string;
+    url: string;
+    type: "external-tool" | "external";
+  }[];
 }

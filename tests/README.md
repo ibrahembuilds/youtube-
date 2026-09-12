@@ -39,8 +39,7 @@ both directions:
 
 Open tags: F04 (json3 timestamps), F05 (summary type), F06 (hour timestamps),
 F07 (double-escaped entities), F10 (badge honesty), F11 (chat gating),
-F12 (download links), F13 (silent truncation), F16 (attribute-order parsing),
-F17 (no 404 route).
+F13 (silent truncation), F16 (attribute-order parsing), F17 (no 404 route).
 
 ## Browser binary
 
