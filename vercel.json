@@ -1,6 +1,10 @@
 {
   "rewrites": [
     { "source": "/api/(.*)", "destination": "/api/$1" },
+    {
+      "source": "/yt-timedtext",
+      "destination": "https://www.youtube.com/api/timedtext"
+    },
     { "source": "/(.*)", "destination": "/index.html" }
   ]
 }

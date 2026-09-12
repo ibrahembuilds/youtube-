@@ -1,0 +1,335 @@
+// Browser end-to-end checks, run against a PRODUCTION build served through the
+// project's real vercel.json rewrites (see prod-server.mjs). Dev-only proxies
+// are deliberately absent here — that gap is what shipped broken before.
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { chromium } from "playwright";
+import { group, check, summarise } from "./harness.mjs";
+import { startProdServer, resolveRewrite } from "./prod-server.mjs";
+
+const PORT = 4173;
+const API_PORT = 3103;
+const BASE = `http://localhost:${PORT}`;
+// Prefer an explicit CHROME_PATH, then any browser already provisioned under
+// PLAYWRIGHT_BROWSERS_PATH (CI images usually pre-install one, and its build
+// number will not match whatever Playwright version is in package.json).
+// Falling through to null lets Playwright resolve its own download, which is
+// what happens on a dev machine after `npx playwright install chromium`.
+function findChrome() {
+  const explicit = process.env.CHROME_PATH;
+  if (explicit && fs.existsSync(explicit)) return explicit;
+
+  const root = process.env.PLAYWRIGHT_BROWSERS_PATH;
+  if (!root || !fs.existsSync(root)) return null;
+
+  const candidates = [
+    "chrome-linux/chrome",
+    "chrome-linux64/chrome",
+    "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+    "chrome-win/chrome.exe",
+  ];
+  for (const dir of fs.readdirSync(root)) {
+    if (!dir.startsWith("chromium-")) continue;
+    for (const rel of candidates) {
+      const candidate = path.join(root, dir, rel);
+      if (fs.existsSync(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+const CHROME = findChrome();
+
+const XML = `<?xml version="1.0" encoding="utf-8"?><transcript>
+<text start="0.5" dur="3.2">Welcome to the show</text>
+<text start="65.8" dur="4.1">The first key point is consistency</text>
+<text start="3725.0" dur="2.5">And that is a wrap</text></transcript>`;
+
+const TRACK_URL = "https://www.youtube.com/api/timedtext?v=TEST1234567&lang=en";
+const META = {
+  tracks: [{
+    languageCode: "en", languageName: "English", kind: "asr", isTranslatable: true,
+    transcriptUrl: TRACK_URL, translationLanguages: [],
+  }],
+  source: "youtube_page_urls", totalTracks: 1,
+};
+
+function startApi() {
+  const child = spawn("node", ["api-server.js"], {
+    env: { ...process.env, API_PORT: String(API_PORT), RATE_LIMIT_MAX: "1000" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return new Promise((resolve, reject) => {
+    let stderr = "";
+    const t = setTimeout(
+      () => reject(new Error(`api server did not start on :${API_PORT}\n${stderr.trim()}`)),
+      15000
+    );
+    child.stderr.on("data", (d) => (stderr += d));
+    child.stdout.on("data", (d) => {
+      if (d.toString().includes("API dev server running")) { clearTimeout(t); resolve(child); }
+    });
+    child.on("error", reject);
+  });
+}
+
+const api = await startApi();
+const prod = await startProdServer({ port: PORT, apiPort: API_PORT });
+const browser = await chromium.launch(CHROME ? { executablePath: CHROME } : {});
+
+/**
+ * Fresh page with every external host stubbed. `sources` decides what each
+ * transcript source returns, so a test can force the fetch chain down a
+ * specific path and record the order the app actually tried them in.
+ */
+async function newPage({ sources = {} } = {}) {
+  const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  const page = await ctx.newPage();
+  const order = [];
+  const errors = [];
+
+  page.on("pageerror", (e) => errors.push(e.message));
+
+  const reply = (route, spec) => {
+    if (!spec || spec === "fail") return route.fulfill({ status: 500, body: "" });
+    if (spec === "spa-shell") return route.fulfill({ status: 200, contentType: "text/html", body: SPA_HTML });
+    if (spec === "empty") return route.fulfill({ status: 200, contentType: "text/xml", body: "" });
+    if (spec === "hang") return new Promise(() => {}); // never resolves
+    return route.fulfill({ status: 200, contentType: "text/xml", body: spec });
+  };
+
+  await page.route("**/*", (route) => {
+    const url = route.request().url();
+    if (url.startsWith(BASE) && !url.includes("/yt-timedtext")) return route.continue();
+
+    if (url.includes("/yt-timedtext")) { order.push("same-origin-proxy"); return reply(route, sources.proxy); }
+    if (url.includes("allorigins")) { order.push("cors-proxy"); return reply(route, sources.cors); }
+    if (url.includes("/api/timedtext") && url.includes("fmt=json3")) { order.push("direct-json3"); return reply(route, sources.directJson3); }
+    if (url.includes("/api/timedtext")) { order.push("direct"); return reply(route, sources.direct); }
+
+    if (url.includes("/oembed")) return route.fulfill({ status: 200, contentType: "application/json",
+      body: JSON.stringify({ title: "Test Video", author_name: "Test Channel", author_url: "", thumbnail_url: "" }) });
+    if (url.includes("/embed/")) return route.fulfill({ status: 200, contentType: "text/html", body: "<html></html>" });
+    return route.fulfill({ status: 204, body: "" });
+  });
+
+  await page.route(`${BASE}/api/transcript`, (r) =>
+    r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(META) }));
+
+  page.__order = order;
+  page.__errors = errors;
+  return { ctx, page };
+}
+
+const SPA_HTML = await (await fetch(`${BASE}/index.html`)).text();
+
+async function loadVideo(page) {
+  await page.goto(`${BASE}/studio`, { waitUntil: "domcontentloaded" });
+  await page.fill("input[placeholder='Paste YouTube link here...']", "https://www.youtube.com/watch?v=TEST1234567");
+  await page.click("button:has-text('Load Video')");
+  await page.waitForSelector("button:has-text('Transcript')", { timeout: 25000 });
+  await page.click("button:has-text('Transcript')");
+  await page.waitForTimeout(700);
+}
+
+const transcriptText = (page) =>
+  page.locator(".font-mono").first().textContent().catch(() => "");
+
+try {
+  group("F01 — routing");
+  {
+    const hit = resolveRewrite("/yt-timedtext");
+    check("vercel.json routes /yt-timedtext off-site, not to index.html",
+      hit.external && hit.destination.includes("youtube.com"),
+      `resolves to ${hit.destination} — without this rule the SPA shell is served with HTTP 200`);
+
+    const res = await fetch(`${BASE}/yt-timedtext?v=x&lang=en`);
+    check("the served app agrees", res.headers.get("x-rewrite-external") === "true",
+      `x-rewrite-target=${res.headers.get("x-rewrite-target")}`);
+  }
+
+  group("F01 — the fetch chain validates what it gets");
+  {
+    // The original bug: any HTTP 200 ended the chain. An unrouted same-origin
+    // path returns the SPA's own HTML, which parses cleanly to zero segments.
+    const { ctx, page } = await newPage({
+      sources: { direct: "fail", directJson3: "fail", proxy: "spa-shell", cors: XML },
+    });
+    await loadVideo(page);
+    const body = await transcriptText(page);
+    check("an HTML shell is rejected, not accepted as an empty transcript",
+      /Welcome to the show/.test(body),
+      `order=${JSON.stringify(page.__order)} body=${JSON.stringify((body || "").slice(0, 80))}`);
+    check("it kept going after the shell and reached a working source",
+      page.__order.includes("cors-proxy"),
+      `order=${JSON.stringify(page.__order)} — the chain stopped early`);
+    await ctx.close();
+  }
+
+  group("F01 — source ordering");
+  {
+    const { ctx, page } = await newPage({ sources: { direct: XML } });
+    await loadVideo(page);
+    check("tries the direct browser fetch first",
+      page.__order[0] === "direct",
+      `order=${JSON.stringify(page.__order)} — the viewer's own IP is the least throttled path`);
+    check("stops as soon as a source works", page.__order.length === 1,
+      `order=${JSON.stringify(page.__order)}`);
+    await ctx.close();
+  }
+
+  group("F01 — an empty body is a failure, not a transcript");
+  {
+    // YouTube answers datacenter IPs with 200 and a zero-length body.
+    const { ctx, page } = await newPage({
+      sources: { direct: "empty", directJson3: "empty", proxy: "empty", cors: XML },
+    });
+    await loadVideo(page);
+    check("falls through 200-with-empty-body responses",
+      /Welcome to the show/.test(await transcriptText(page)),
+      `order=${JSON.stringify(page.__order)}`);
+    await ctx.close();
+  }
+
+  group("F01 — failure is visible, never silent");
+  {
+    const { ctx, page } = await newPage({
+      sources: { direct: "fail", directJson3: "fail", proxy: "fail", cors: "fail" },
+    });
+    await loadVideo(page);
+    const shown = await page.locator("text=Could not load transcript").count();
+    check("all sources failing shows an explicit empty state", shown > 0,
+      "the user must not be left with a silently blank transcript");
+    check("every source was attempted", page.__order.length === 4,
+      `order=${JSON.stringify(page.__order)}`);
+    await ctx.close();
+  }
+
+  group("F01 — a hung source cannot wedge the UI");
+  {
+    const { ctx, page } = await newPage({
+      sources: { direct: "hang", directJson3: XML },
+    });
+    await page.goto(`${BASE}/studio`, { waitUntil: "domcontentloaded" });
+    await page.fill("input[placeholder='Paste YouTube link here...']", "https://www.youtube.com/watch?v=TEST1234567");
+    await page.click("button:has-text('Load Video')");
+    await page.waitForTimeout(12000);
+    const enabled = await page.locator("input[placeholder='Paste YouTube link here...']").isEnabled();
+    check("the URL input is re-enabled after a stalled fetch", enabled,
+      "an 8s timeout bounds each source so the chain cannot hang forever");
+    await ctx.close();
+  }
+
+  group("Landing and routing");
+  {
+    const { ctx, page } = await newPage();
+    await page.goto(BASE, { waitUntil: "domcontentloaded" });
+    check("hero renders", /One link\. Every insight/.test((await page.textContent("h1")) || ""));
+    await page.click("a[href='/studio']:has-text('Try it free')");
+    await page.waitForURL("**/studio");
+    check("navigates to the studio", page.url().endsWith("/studio"));
+    check("no uncaught page errors", page.__errors.length === 0, page.__errors.join(" | "));
+
+    await page.goto(`${BASE}/does-not-exist`, { waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(300);
+    check("an unknown route renders something", ((await page.textContent("body")) || "").trim().length > 0,
+      "no catch-all <Route> is defined, so the page is completely blank", "F17");
+    await ctx.close();
+  }
+
+  group("URL parsing");
+  {
+    const { ctx, page } = await newPage({ sources: { direct: XML } });
+    const cases = [
+      ["https://www.youtube.com/watch?v=dQw4w9WgXcQ", true],
+      ["https://youtu.be/dQw4w9WgXcQ", true],
+      ["https://www.youtube.com/shorts/dQw4w9WgXcQ", true],
+      ["dQw4w9WgXcQ", true],
+      ["https://vimeo.com/12345", false],
+      ["not a url", false],
+    ];
+    const wrong = [];
+    for (const [input, shouldAccept] of cases) {
+      await page.goto(`${BASE}/studio`, { waitUntil: "domcontentloaded" });
+      await page.fill("input[placeholder='Paste YouTube link here...']", input);
+      await page.click("button:has-text('Load Video')");
+      await page.waitForTimeout(400);
+      const rejected = (await page.locator("text=Please enter a valid YouTube URL").count()) > 0;
+      if (rejected === shouldAccept) wrong.push(input);
+    }
+    check("accepts every YouTube URL shape and rejects the rest", wrong.length === 0, `wrong: ${wrong.join(", ")}`);
+    await ctx.close();
+  }
+
+  group("Known open findings");
+  {
+    const { ctx, page } = await newPage({ sources: { direct: XML } });
+    const sent = [];
+    await page.route(`${BASE}/api/summary`, async (r) => {
+      sent.push(JSON.parse(r.request().postData() || "{}").type);
+      await r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ response: "ok" }) });
+    });
+    await loadVideo(page);
+    await page.click("button:has-text('Summary')");
+    await page.waitForTimeout(600);
+    await page.click("button:has-text('Detailed')");
+    await page.waitForTimeout(600);
+    check("summary sends the type that was clicked", sent[1] === "detailed",
+      `clicked "Detailed", sent type="${sent[1]}" — handleSummary reads state that has not committed yet`, "F05");
+    await ctx.close();
+  }
+  {
+    const { ctx, page } = await newPage({
+      sources: { direct: "fail", directJson3: "fail", proxy: "fail", cors: "fail" },
+    });
+    await loadVideo(page);
+    const badge = ((await page.locator(".badge.bg-green-50").textContent().catch(() => "")) || "").replace(/\s+/g, " ").trim();
+    check("header badge reflects what actually loaded", !/1 language/.test(badge),
+      `shows "${badge}" with zero transcripts loaded`, "F10");
+
+    await page.click("button:has-text('Chat')");
+    await page.waitForTimeout(300);
+    check("chat is gated when no transcript is usable",
+      (await page.locator("text=Chat requires captions").count()) > 0,
+      "input is shown but Send is a silent no-op — the gate tests selectedTrack, handleChat tests transcriptText", "F11");
+    await ctx.close();
+  }
+  {
+    const { ctx, page } = await newPage({ sources: { direct: XML } });
+    await loadVideo(page);
+    await page.click("button:has-text('Download')");
+    await page.waitForTimeout(5000);
+    const links = await page.locator("a[target='_blank']").evaluateAll((els) =>
+      els.map((e) => ({ href: e.href, label: e.querySelector("p")?.textContent })));
+    const mp4 = links.find((l) => /MP4/.test(l.label || ""));
+    const mp3 = links.find((l) => /MP3/.test(l.label || ""));
+    check("video and audio downloads are distinct destinations",
+      !!mp4 && !!mp3 && mp4.href !== mp3.href,
+      `both point at ${mp4?.href} — neither downloads anything`, "F12");
+    await ctx.close();
+  }
+
+  group("Responsive and accessibility");
+  {
+    const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+    const page = await ctx.newPage();
+    await page.route("**/*", (r) => (r.request().url().startsWith(BASE) ? r.continue() : r.fulfill({ status: 204, body: "" })));
+    await page.goto(BASE, { waitUntil: "domcontentloaded" });
+    check("no horizontal overflow at 390px",
+      (await page.evaluate(() => document.documentElement.scrollWidth)) <= 391);
+    check("every image has alt text", (await page.locator("img:not([alt])").count()) === 0);
+    await page.goto(`${BASE}/studio`, { waitUntil: "domcontentloaded" });
+    check("interactive controls have accessible names",
+      (await page.evaluate(() => [...document.querySelectorAll("input,select,button")]
+        .filter((e) => !e.getAttribute("aria-label") && !e.textContent.trim()
+          && !e.getAttribute("placeholder") && !document.querySelector(`label[for="${e.id}"]`)).length)) === 0);
+    await ctx.close();
+  }
+} finally {
+  await browser.close();
+  prod.close();
+  api.kill();
+}
+
+summarise("E2E");

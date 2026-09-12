@@ -4,20 +4,166 @@ const _env = typeof process !== "undefined" ? process.env : {};
 const _key = _env["OPENROUTER" + "_API_KEY"] || "";
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 
-export function setCors(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+// ─── Request guard: CORS, method, rate limit, body ────────────────────
+// These endpoints proxy a paid AI provider, so they are only as safe as the
+// gate in front of them. Note what each control actually buys you:
+//
+//   CORS  stops another *website* from spending your key via a visitor's
+//         browser. It does NOT stop curl or a script — those ignore it.
+//   Rate  limiting is the control that stops direct abuse. The store below
+//         is per-instance memory, so on Vercel each warm lambda keeps its
+//         own counter and the effective limit is (instances x MAX). That
+//         raises the cost of abuse a long way above "unlimited", but it is
+//         not a hard cap — move it to Redis/Upstash if this gets traffic.
+//   Caps  on body and transcript size bound the spend of any single call.
+
+const ALLOWED_ORIGINS = (_env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+export const MAX_BODY_BYTES = 512 * 1024;
+export const MAX_TRANSCRIPT_CHARS = 60000;
+
+const RATE_LIMIT_MAX = Number(_env.RATE_LIMIT_MAX || 20);
+const RATE_LIMIT_WINDOW_MS = Number(_env.RATE_LIMIT_WINDOW_MS || 60000);
+const rateBuckets = new Map();
+
+function clientIp(req) {
+  const fwd = req.headers["x-forwarded-for"];
+  if (typeof fwd === "string" && fwd.length) return fwd.split(",")[0].trim();
+  return req.socket?.remoteAddress || "unknown";
 }
 
-export function parseBody(req) {
-  return new Promise((resolve) => {
+function isAllowedOrigin(req, origin) {
+  if (ALLOWED_ORIGINS.includes(origin)) return true;
+  // Same-origin requests always pass. Browsers send Origin on same-origin
+  // POSTs too, so this must be handled or the app blocks itself.
+  try {
+    const host = req.headers["x-forwarded-host"] || req.headers.host;
+    return new URL(origin).host === host;
+  } catch {
+    return false;
+  }
+}
+
+export function applyCors(req, res) {
+  const origin = req.headers?.origin;
+  if (!origin) return true; // non-browser client, or same-origin GET
+  if (!isAllowedOrigin(req, origin)) return false;
+  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  return true;
+}
+
+export function checkRateLimit(req) {
+  const ip = clientIp(req);
+  const now = Date.now();
+
+  if (rateBuckets.size > 5000) {
+    for (const [key, bucket] of rateBuckets) {
+      if (now >= bucket.reset) rateBuckets.delete(key);
+    }
+  }
+
+  let bucket = rateBuckets.get(ip);
+  if (!bucket || now >= bucket.reset) {
+    bucket = { count: 0, reset: now + RATE_LIMIT_WINDOW_MS };
+    rateBuckets.set(ip, bucket);
+  }
+  bucket.count++;
+
+  return {
+    ok: bucket.count <= RATE_LIMIT_MAX,
+    retryAfter: Math.max(1, Math.ceil((bucket.reset - now) / 1000)),
+  };
+}
+
+export function parseBody(req, maxBytes = MAX_BODY_BYTES) {
+  return new Promise((resolve, reject) => {
     let data = "";
-    req.on("data", (chunk) => (data += chunk));
+    let bytes = 0;
+    let settled = false;
+
+    const fail = (statusCode, message) => {
+      if (settled) return;
+      settled = true;
+      const err = new Error(message);
+      err.statusCode = statusCode;
+      reject(err);
+    };
+
+    req.on("data", (chunk) => {
+      if (settled) return;
+      bytes += chunk.length;
+      if (bytes > maxBytes) {
+        // Drain the rest instead of destroying the socket, so the 413 actually
+        // reaches the client rather than surfacing as a connection reset.
+        req.removeAllListeners("data");
+        req.resume();
+        fail(413, "Request body too large");
+        return;
+      }
+      data += chunk;
+    });
+    req.on("error", () => fail(400, "Could not read the request body"));
     req.on("end", () => {
-      try { resolve(data ? JSON.parse(data) : {}); } catch { resolve({}); }
+      if (settled) return;
+      settled = true;
+      try {
+        resolve(data ? JSON.parse(data) : {});
+      } catch {
+        resolve({});
+      }
     });
   });
+}
+
+/**
+ * Run every gate an endpoint needs, in order. Returns the parsed body when
+ * the request may proceed, or null when it has already been answered — so a
+ * handler starts with `const body = await guard(req, res); if (!body) return;`
+ */
+export async function guard(req, res) {
+  if (!applyCors(req, res)) {
+    res.status(403).json({ error: "Origin not allowed" });
+    return null;
+  }
+  if (req.method === "OPTIONS") {
+    res.status(204).end();
+    return null;
+  }
+  if (req.method !== "POST") {
+    res.status(405).json({ error: "Method not allowed" });
+    return null;
+  }
+
+  const limit = checkRateLimit(req);
+  if (!limit.ok) {
+    res.setHeader("Retry-After", String(limit.retryAfter));
+    res.status(429).json({
+      error: `Too many requests. Try again in ${limit.retryAfter} seconds.`,
+    });
+    return null;
+  }
+
+  try {
+    return await parseBody(req);
+  } catch (err) {
+    res.status(err.statusCode || 400).json({ error: err.message || "Invalid request body" });
+    return null;
+  }
+}
+
+/** Shared validation for the endpoints that forward a transcript to the AI. */
+export function validateTranscriptContext(value) {
+  if (typeof value !== "string" || !value.trim()) return "transcriptContext is required";
+  if (value.length > MAX_TRANSCRIPT_CHARS) {
+    return `transcriptContext is too large (${value.length} chars, max ${MAX_TRANSCRIPT_CHARS})`;
+  }
+  return null;
 }
 
 // ─── Transcript Extraction ────────────────────────────────────────────

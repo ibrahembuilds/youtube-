@@ -1,11 +1,9 @@
-import { setCors, parseBody, fetchAllTranscripts } from "./_lib.js";
+import { guard, fetchAllTranscripts } from "./_lib.js";
 
 export default async function handler(req, res) {
-  setCors(res);
-  if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+  const body = await guard(req, res);
+  if (!body) return;
 
-  const body = await parseBody(req);
   const { videoId } = body;
 
   if (!videoId) return res.status(400).json({ error: "videoId is required" });
