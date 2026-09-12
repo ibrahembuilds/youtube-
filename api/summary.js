@@ -1,4 +1,4 @@
-import { guard, callAI, validateTranscriptContext } from "./_lib.js";
+import { guard, callAI, validateTranscriptContext, MODELS } from "./_lib.js";
 
 export default async function handler(req, res) {
   const body = await guard(req, res);
@@ -30,7 +30,7 @@ export default async function handler(req, res) {
       },
     ];
 
-    const response = await callAI(messages);
+    const response = await callAI(messages, { model: MODELS.summary });
     res.json({ response });
   } catch (err) {
     console.error("Summary error:", err.message);

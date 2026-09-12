@@ -4,6 +4,26 @@ const _env = typeof process !== "undefined" ? process.env : {};
 const _key = _env["OPENROUTER" + "_API_KEY"] || "";
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 
+// ─── Model selection ──────────────────────────────────────────────────
+// One model per task, each overridable by env var so you can retune cost or
+// quality without a deploy. Prices below are USD per 1M tokens, read from
+// OpenRouter on 2026-09-12.
+//
+//   gpt-5-nano  $0.05 in / $0.40 out / $0.005 cached   cheap, 400k context
+//   gpt-5-mini  $0.25 in / $2.00 out / $0.025 cached   used where output
+//                                                      quality actually bites
+//
+// Viral shorts and translation keep the stronger model on purpose: viral must
+// return strictly parseable JSON, and translation has to hold tone across 19
+// languages. Those are exactly where the cheapest models fail. Point them at
+// gpt-5-nano (or deepseek/deepseek-v4-flash) if you want to test that trade.
+export const MODELS = {
+  chat: _env.AI_MODEL_CHAT || "openai/gpt-5-nano",
+  summary: _env.AI_MODEL_SUMMARY || "openai/gpt-5-nano",
+  viral: _env.AI_MODEL_VIRAL || "openai/gpt-5-mini",
+  translate: _env.AI_MODEL_TRANSLATE || "openai/gpt-5-mini",
+};
+
 // ─── Request guard: CORS, method, rate limit, body ────────────────────
 // These endpoints proxy a paid AI provider, so they are only as safe as the
 // gate in front of them. Note what each control actually buys you:
@@ -445,37 +465,42 @@ export async function translateTranscript(segments, targetLanguage) {
 }
 
 async function translateChunk(text, targetLanguage) {
-  const res = await fetch(OPENROUTER_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${_key}`,
-      "HTTP-Referer": "https://yt-studio.vercel.app",
-      "X-Title": "YT Studio",
-    },
-    body: JSON.stringify({
-      model: "~openai/gpt-mini-latest",
-      messages: [
-        {
-          role: "system",
-          content: `You are a professional translator. Translate the following text to ${targetLanguage}. Preserve ALL meaning, tone, and nuance. Return ONLY the translated text — no explanations, no notes, no quotation marks.`,
-        },
-        { role: "user", content: text },
-      ],
-      temperature: 0.3,
-      max_tokens: 4096,
-    }),
-  });
-
-  if (!res.ok) throw new Error(`Translation failed: ${await res.text()}`);
-  const data = await res.json();
-  return data.choices[0].message.content.trim();
+  const content = await callAI(
+    [
+      {
+        role: "system",
+        content: `You are a professional translator. Translate the following text to ${targetLanguage}. Preserve ALL meaning, tone, and nuance. Return ONLY the translated text — no explanations, no notes, no quotation marks.`,
+      },
+      { role: "user", content: text },
+    ],
+    { model: MODELS.translate, maxTokens: 4096 }
+  );
+  return content.trim();
 }
 
 // ─── AI Chat ───────────────────────────────────────────────────────────
 
-export async function callAI(messages, model = "~openai/gpt-mini-latest") {
+export async function callAI(messages, options = {}) {
   if (!_key) throw new Error("API key not configured");
+
+  const {
+    model = MODELS.chat,
+    maxTokens = 4000,
+    temperature,
+    json = false,
+  } = options;
+
+  const payload = { model, messages, max_tokens: maxTokens };
+
+  // Only send temperature when a caller asks for it. Several models — including
+  // every gpt-5 tier — do not accept the parameter at all, so sending it blindly
+  // (as this code used to) just gets it dropped and creates a false impression
+  // that output randomness is being controlled.
+  if (typeof temperature === "number") payload.temperature = temperature;
+
+  // Ask the provider to guarantee syntactically valid JSON. This is the real
+  // control for structured output, and it works on models where temperature does not.
+  if (json) payload.response_format = { type: "json_object" };
 
   const res = await fetch(OPENROUTER_URL, {
     method: "POST",
@@ -485,10 +510,18 @@ export async function callAI(messages, model = "~openai/gpt-mini-latest") {
       "HTTP-Referer": "https://yt-studio.vercel.app",
       "X-Title": "YT Studio",
     },
-    body: JSON.stringify({ model, messages, temperature: 0.7, max_tokens: 4000 }),
+    body: JSON.stringify(payload),
   });
 
   if (!res.ok) throw new Error(`AI request failed: ${await res.text()}`);
   const data = await res.json();
-  return data.choices[0].message.content;
+
+  // OpenRouter can answer 200 with an error body and no choices — on a
+  // moderation block, an upstream provider failure, or exhausted credit.
+  // Reading data.choices[0] blindly turns that into a raw TypeError.
+  const content = data?.choices?.[0]?.message?.content;
+  if (typeof content !== "string") {
+    throw new Error(data?.error?.message || "The AI provider returned no completion.");
+  }
+  return content;
 }

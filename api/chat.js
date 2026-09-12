@@ -1,4 +1,4 @@
-import { guard, callAI, validateTranscriptContext } from "./_lib.js";
+import { guard, callAI, validateTranscriptContext, MODELS } from "./_lib.js";
 
 export default async function handler(req, res) {
   const body = await guard(req, res);
@@ -25,7 +25,7 @@ ${transcriptContext}`;
       ...messages,
     ];
 
-    const response = await callAI(aiMessages);
+    const response = await callAI(aiMessages, { model: MODELS.chat });
     res.json({ response });
   } catch (err) {
     console.error("Chat error:", err.message);
