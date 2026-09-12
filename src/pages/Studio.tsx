@@ -5,7 +5,7 @@ import { extractVideoId, getEmbedUrl, getThumbnail, fetchVideoInfo, type VideoIn
 import {
   fetchTranscriptMeta, fetchAllTranscriptContent, fetchTranscriptContent,
   translateTranscript, chatWithVideo, generateSummary, generateViralShorts,
-  getDownloadInfo, formatTranscriptText, TranscriptLookupError,
+  getDownloadInfo, formatTranscriptText, formatTimestamp, transcriptCoverage, TranscriptLookupError,
   type ChatMessage, type TranscriptSegment, type TranscriptResult,
   type TranscriptTrack, type ViralShort, type DownloadInfo,
 } from "@/lib/ai";
@@ -54,6 +54,8 @@ function defaultTargetLanguage(trackCode: string | undefined): string {
   return (SUPPORTED_LANGUAGES.find((l) => l.code !== track) || SUPPORTED_LANGUAGES[0]).name;
 }
 
+const EMPTY_SEGMENTS: TranscriptSegment[] = [];
+
 export default function Studio() {
   const [url, setUrl] = useState("");
   const [videoId, setVideoId] = useState<string | null>(null);
@@ -91,11 +93,21 @@ export default function Studio() {
   const [translating, setTranslating] = useState(false);
 
   // Derived state
-  const selectedSegments = trackSegments.get(selectedTrackIndex) || [];
+  // Memoised because the `|| []` fallback would otherwise hand downstream
+  // hooks a brand-new array on every render.
+  const selectedSegments = useMemo(
+    () => trackSegments.get(selectedTrackIndex) ?? EMPTY_SEGMENTS,
+    [trackSegments, selectedTrackIndex]
+  );
   const selectedTrack = transcriptMeta?.tracks?.[selectedTrackIndex] ?? null;
   const transcriptText = formatTranscriptText(selectedSegments);
 
   const trackCode = selectedTrack?.languageCode;
+
+  // The AI context is capped, so on a long video the summary and shorts are
+  // built from only the opening stretch. Silently returning a partial answer
+  // reads as a complete one, so say what was covered.
+  const coverage = useMemo(() => transcriptCoverage(selectedSegments), [selectedSegments]);
 
   // Translating a transcript into its own language is a no-op, and the button
   // for it is disabled. Defaulting the dropdown to "English" therefore left the
@@ -392,6 +404,13 @@ export default function Studio() {
 
             <div className="min-h-[400px]">
               {activeTab === "watch" && <WatchTab videoId={videoId} videoInfo={videoInfo} selectedTrack={selectedTrack} segmentCount={selectedSegments.length} />}
+              {coverage.truncated && activeTab !== "watch" && activeTab !== "download" && (
+                <div className="mb-4 badge bg-amber-50 text-amber-700">
+                  <Clock className="w-3 h-3" />
+                  AI reads the first {formatTimestamp(coverage.lastIncludedStart)} of this video
+                  ({coverage.includedSegments} of {coverage.totalSegments} segments)
+                </div>
+              )}
               {activeTab === "transcript" && (
                 <TranscriptTab
                   segments={selectedSegments}
@@ -550,13 +569,30 @@ function TranscriptTab({
       </div>
       <div className="card p-6">
         <div className="max-h-[600px] overflow-y-auto">
-          <div className="whitespace-pre-wrap text-sm text-ink-700 leading-relaxed font-mono">
-            {translatedText || segments.map((s) => {
-              const m = Math.floor(s.start / 60);
-              const sec = Math.floor(s.start % 60);
-              return `[${m}:${sec.toString().padStart(2, "0")}] ${s.text}`;
-            }).join("\n")}
-          </div>
+          {translatedText ? (
+            // dir="auto" lets the browser pick the paragraph direction from the
+            // text itself, so an Arabic or Hebrew translation reads correctly
+            // instead of being laid out left-to-right.
+            <p dir="auto" className="whitespace-pre-wrap text-sm text-ink-700 leading-relaxed">
+              {translatedText}
+            </p>
+          ) : (
+            // One row per segment rather than a single pre-wrapped string.
+            // As one string the timestamp became part of the line's bidi run,
+            // which pushed [0:00] to the visual END of every right-to-left
+            // line. Separating the cells keeps timestamps in a left column for
+            // every script, and lets each caption lay itself out.
+            <div className="text-sm text-ink-700 leading-relaxed">
+              {segments.map((seg, i) => (
+                <div key={i} className="flex gap-3 py-0.5">
+                  <span className="shrink-0 text-ink-400 font-mono text-xs pt-0.5 tabular-nums select-none">
+                    {formatTimestamp(seg.start)}
+                  </span>
+                  <span dir="auto" className="min-w-0 flex-1">{seg.text}</span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -640,7 +676,7 @@ function ViralTab({ shorts, loading, onRegenerate }: { shorts: ViralShort[]; loa
               <div>
                 <h3 className="font-semibold text-base">{short.title}</h3>
                 <div className="flex items-center gap-3 mt-1 text-xs text-ink-400">
-                  <span className="flex items-center gap-1"><Clock className="w-3 h-3" />{fmt(short.startTime)} - {fmt(short.endTime)}</span>
+                  <span className="flex items-center gap-1"><Clock className="w-3 h-3" />{formatTimestamp(short.startTime)} - {formatTimestamp(short.endTime)}</span>
                   <span className={`badge ${short.viralScore >= 80 ? "bg-green-50 text-green-600" : "bg-amber-50 text-amber-600"}`}>Viral score: {short.viralScore}/100</span>
                 </div>
               </div>
@@ -743,7 +779,5 @@ function DownloadTab({ info, loading }: { info: DownloadInfo | null; loading: bo
   );
 }
 
-function fmt(s: number): string {
-  const m = Math.floor(s / 60), sec = Math.floor(s % 60);
-  return `${m}:${sec.toString().padStart(2, "0")}`;
-}
+// Timestamps come from formatTimestamp so every surface agrees, including
+// past the one-hour mark.

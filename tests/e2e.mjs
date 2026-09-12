@@ -133,8 +133,10 @@ async function loadVideo(page) {
   await page.waitForTimeout(700);
 }
 
+// The transcript is a list of rows (timestamp cell + caption cell), not one
+// pre-wrapped block, so read the whole scrolling container.
 const transcriptText = (page) =>
-  page.locator(".font-mono").first().textContent().catch(() => "");
+  page.locator(".card.p-6 .overflow-y-auto").first().textContent().catch(() => "");
 
 try {
   group("F01 — routing");

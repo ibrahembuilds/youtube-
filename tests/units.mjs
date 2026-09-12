@@ -5,6 +5,8 @@ import {
   parseTranscriptXml,
   parseTranscriptJson3,
   formatTranscriptText,
+  formatTimestamp,
+  transcriptCoverage,
 } from "../src/lib/ai.ts";
 import {
   extractJsonObject, normaliseShorts, MIN_CLIP_SECONDS, MAX_CLIP_SECONDS,
@@ -13,70 +15,113 @@ import { classifyWatchPage } from "../api/_lib.js";
 
 group("XML caption parsing");
 {
-  const single = parseTranscriptXml(`<text start="0" dur="1">it&#39;s fine &quot;ok&quot;</text>`);
-  check("decodes single-escaped entities", single[0]?.text === `it's fine "ok"`, `got ${JSON.stringify(single[0]?.text)}`);
+  const one = parseTranscriptXml(`<text start="0" dur="1">it&#39;s fine &quot;ok&quot;</text>`);
+  check("decodes single-escaped entities", one[0]?.text === `it's fine "ok"`, `got ${JSON.stringify(one[0]?.text)}`);
 
-  const nested = parseTranscriptXml(`<text start="0" dur="1">A &amp;lt;b&amp;gt; tag</text>`);
-  check("decodes nested lt/gt entities", nested[0]?.text === "A <b> tag", `got ${JSON.stringify(nested[0]?.text)}`);
-
-  // YouTube double-escapes a literal ampersand as &amp;amp;. The decode chain
-  // replaces /&amp;/ first, which consumes the outer entity and leaves "&amp;".
+  // YouTube writes a literal & as &amp;amp;. Chained replaces used to eat the
+  // outer entity first and leave "&amp;" visible in the transcript.
   const amp = parseTranscriptXml(`<text start="0" dur="1">Rock &amp;amp; Roll</text>`);
-  check("decodes double-escaped ampersand", amp[0]?.text === "Rock & Roll",
-    `got ${JSON.stringify(amp[0]?.text)} — chained replaces corrupt each other`, "F07");
+  check("decodes double-escaped ampersand", amp[0]?.text === "Rock & Roll", `got ${JSON.stringify(amp[0]?.text)}`);
 
-  const ordered = parseTranscriptXml(`<text start="0" dur="1">hi</text>`);
-  check("parses canonical attribute order", ordered.length === 1, `got ${ordered.length} segments`);
+  check("decodes nested lt/gt", parseTranscriptXml(`<text start="0" dur="1">A &amp;lt;b&amp;gt; tag</text>`)[0]?.text === "A <b> tag");
 
-  const reordered = parseTranscriptXml(`<text dur="1" start="0">hi</text>`);
-  check("tolerates reordered attributes", reordered.length === 1,
-    `got ${reordered.length} segments — regex hardcodes start-then-dur, so the whole track is silently lost`, "F16");
+  check("decodes numeric references",
+    parseTranscriptXml(`<text start="0" dur="1">caf&#233; &#x627;&#x644;&#x639;</text>`)[0]?.text === "café الع",
+    `got ${JSON.stringify(parseTranscriptXml(`<text start="0" dur="1">caf&#233; &#x627;&#x644;&#x639;</text>`)[0]?.text)}`);
+
+  check("leaves an unknown entity alone rather than mangling it",
+    parseTranscriptXml(`<text start="0" dur="1">5 &widget; 3</text>`)[0]?.text === "5 &widget; 3");
+
+  check("parses canonical attribute order", parseTranscriptXml(`<text start="0" dur="1">hi</text>`).length === 1);
+
+  // The regex used to hard-code start-then-dur, so any variation silently
+  // dropped the entire track.
+  check("tolerates reordered attributes", parseTranscriptXml(`<text dur="1" start="0">hi</text>`).length === 1,
+    `got ${parseTranscriptXml(`<text dur="1" start="0">hi</text>`).length} segments`);
+  check("tolerates a missing dur", parseTranscriptXml(`<text start="7">hi</text>`).length === 1);
+  check("tolerates extra attributes", parseTranscriptXml(`<text start="0" dur="1" w="1" wWinId="0">hi</text>`).length === 1);
+  check("skips a segment with no start", parseTranscriptXml(`<text dur="1">hi</text>`).length === 0);
+
+  check("strips inline markup",
+    parseTranscriptXml(`<text start="0" dur="1">a <b>bold</b> word</text>`)[0]?.text === "a bold word");
+
+  check("handles multi-line caption bodies",
+    parseTranscriptXml(`<text start="0" dur="1">line one\nline two</text>`)[0]?.text === "line one line two");
 
   check("skips empty text nodes",
     parseTranscriptXml(`<text start="0" dur="1"></text><text start="2" dur="1">real</text>`).length === 1);
 
-  check("reads start and duration as numbers", ordered[0]?.start === 0 && ordered[0]?.duration === 1,
-    `got start=${ordered[0]?.start} duration=${ordered[0]?.duration}`);
+  check("reads start and duration as numbers",
+    parseTranscriptXml(`<text start="1.5" dur="2.25">hi</text>`)[0]?.start === 1.5);
 }
 
 group("JSON3 caption parsing");
 {
-  // Real fmt=json3 shape: timing lives on the EVENT; segments carry tOffsetMs.
-  const json = JSON.stringify({
-    events: [
-      { tStartMs: 0, dDurationMs: 2400, segs: [{ utf8: "Hello", tOffsetMs: 0 }, { utf8: " world", tOffsetMs: 800 }] },
-      { tStartMs: 65800, dDurationMs: 4100, segs: [{ utf8: "Later line", tOffsetMs: 0 }] },
-    ],
-  });
-  const segs = parseTranscriptJson3(json);
+  // Real fmt=json3 shape: timing on the EVENT, offsets on the segments.
+  const real = JSON.stringify({ events: [
+    { tStartMs: 0, dDurationMs: 2400, segs: [{ utf8: "Hello", tOffsetMs: 0 }, { utf8: " world", tOffsetMs: 800 }] },
+    { tStartMs: 65800, dDurationMs: 4100, segs: [{ utf8: "Later line", tOffsetMs: 0 }] },
+    { tStartMs: 3725000, dDurationMs: 2500, segs: [{ utf8: "Past an hour", tOffsetMs: 0 }] },
+  ]});
+  const segs = parseTranscriptJson3(real);
 
-  check("extracts segment text", segs.map((s) => s.text).join("|") === "Hello|world|Later line",
-    `got ${JSON.stringify(segs.map((s) => s.text))}`);
+  check("joins an event's word-level pieces into one line",
+    segs[0]?.text === "Hello world",
+    `got ${JSON.stringify(segs.map((x) => x.text))} — YouTube splits captions per word`);
 
-  check("reads start time from the event", segs[2]?.start === 65.8,
-    `starts = ${JSON.stringify(segs.map((s) => s.start))} — code reads seg.tStartMs, which does not exist, so every segment is 0`, "F04");
+  check("reads start time from the event, not the segment",
+    segs[1]?.start === 65.8, `starts = ${JSON.stringify(segs.map((x) => x.start))}`);
 
-  check("reads a real duration", segs[0]?.duration !== 2,
-    `durations = ${JSON.stringify(segs.map((s) => s.duration))} — all fall back to the hardcoded 2s`, "F04");
+  check("reads duration from the event", segs[0]?.duration === 2.4,
+    `durations = ${JSON.stringify(segs.map((x) => x.duration))}`);
+
+  check("keeps sub-hour and past-hour starts distinct",
+    segs[2]?.start === 3725, `got ${segs[2]?.start}`);
+
+  check("drops events with no text",
+    parseTranscriptJson3(JSON.stringify({ events: [{ tStartMs: 0, segs: [{ utf8: "\n" }] }] })).length === 0);
 
   check("returns [] for malformed json", parseTranscriptJson3("{{{not json").length === 0);
+  check("returns [] when events is missing", parseTranscriptJson3("{}").length === 0);
 }
 
-group("Transcript text sent to the AI");
+group("Timestamps the AI quotes back");
 {
+  check("under a minute", formatTimestamp(41) === "0:41", formatTimestamp(41));
+  check("minutes and seconds", formatTimestamp(65.8) === "1:05", formatTimestamp(65.8));
+  // 3725s used to render as "62:05" — a timestamp no viewer can find.
+  check("past one hour", formatTimestamp(3725) === "1:02:05", formatTimestamp(3725));
+  check("past two hours", formatTimestamp(7385) === "2:03:05", formatTimestamp(7385));
+  check("exactly one hour", formatTimestamp(3600) === "1:00:00", formatTimestamp(3600));
+  check("zero", formatTimestamp(0) === "0:00", formatTimestamp(0));
+  check("negative is clamped", formatTimestamp(-5) === "0:00", formatTimestamp(-5));
+  check("non-numeric is safe", formatTimestamp(NaN) === "0:00", formatTimestamp(NaN));
+
   const text = formatTranscriptText([
     { text: "a", start: 65.8, duration: 1 },
     { text: "b", start: 3725, duration: 1 },
   ]);
-  check("formats minutes and seconds", text.includes("[1:05]"), `got ${JSON.stringify(text)}`);
-  check("keeps hour-long videos unambiguous", text.includes("[1:02:05]"),
-    `got ${JSON.stringify(text)} — 3725s renders as "62:05"; api/_lib.js formatTime() handles hours, this copy does not`, "F06");
+  check("the AI context uses hour-aware timestamps",
+    text.includes("[1:05]") && text.includes("[1:02:05]"), JSON.stringify(text));
+}
 
+group("Truncation is reported, not hidden");
+{
   const many = Array.from({ length: 40000 }, (_, i) => ({ text: "word word word", start: i * 2, duration: 2 }));
-  const truncated = formatTranscriptText(many);
-  check("caps the payload at 50k chars", truncated.length <= 50000, `got ${truncated.length}`);
-  check("tells the caller it truncated", false,
-    `kept ${truncated.split("\n").length - 1} of ${many.length} segments and returns a bare string — the UI cannot tell`, "F13");
+  const out = formatTranscriptText(many);
+  check("caps the payload", out.length <= 50000, `got ${out.length}`);
+
+  const cov = transcriptCoverage(many);
+  check("reports that it truncated", cov.truncated === true);
+  check("reports how much was included",
+    cov.includedSegments > 0 && cov.includedSegments < cov.totalSegments,
+    `${cov.includedSegments} of ${cov.totalSegments}`);
+  check("reports where coverage stops",
+    cov.lastIncludedStart > 0 && formatTimestamp(cov.lastIncludedStart).includes(":"),
+    `stops at ${formatTimestamp(cov.lastIncludedStart)}`);
+
+  const small = transcriptCoverage([{ text: "a", start: 0, duration: 1 }]);
+  check("a short transcript is not reported as truncated", small.truncated === false);
 }
 
 group("Viral shorts — surviving a cheaper model's output");

@@ -48,11 +48,27 @@ if you need a hard cap.
 ## Tests
 
 ```bash
-npm test            # units + api + e2e
+npm test            # units + api + e2e + languages
 npm run test:unit   # caption parsers, imported from src/
 npm run test:api    # /api contract, CORS, rate limits — spawns its own server
 npm run test:e2e    # real Chromium against a production build
+npm run test:lang   # transcript rendering in 8 scripts, including right-to-left
 ```
+
+## Diagnosing one video
+
+Whether a given video works depends on whether it has captions and whether
+YouTube is challenging the server at that moment. This prints which stage
+failed and what it means:
+
+```bash
+npm run check -- "https://www.youtube.com/watch?v=VIDEO_ID"
+npm run check -- VIDEO_ID --app https://your-app.vercel.app
+```
+
+It checks the URL, whether the video is public (via oEmbed, which only answers
+for public videos), the caption-track lookup, and each track's download — and
+flags the case where oEmbed and the lookup contradict each other.
 
 The E2E suite runs against a production build served through the rewrite rules
 in this repo's own `vercel.json`, because dev and production route
