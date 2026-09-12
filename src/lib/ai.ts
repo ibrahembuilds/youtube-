@@ -35,6 +35,26 @@ export interface TranscriptResult {
 
 // ─── Server API calls ────────────────────────────────────────────────
 
+/**
+ * Why a transcript lookup failed. The UI reacts differently to each:
+ * `throttled` is temporary and worth retrying, `no_captions` never will be.
+ */
+export type TranscriptErrorCode =
+  | "throttled"
+  | "no_captions"
+  | "unavailable"
+  | "upstream_error"
+  | "unknown";
+
+export class TranscriptLookupError extends Error {
+  code: TranscriptErrorCode;
+  constructor(message: string, code: TranscriptErrorCode) {
+    super(message);
+    this.name = "TranscriptLookupError";
+    this.code = code;
+  }
+}
+
 /** Fetch track metadata (URLs only — no transcript content yet). */
 export async function fetchTranscriptMeta(videoId: string): Promise<TranscriptResult> {
   const res = await fetch(`${API_BASE}/transcript`, {
@@ -43,8 +63,11 @@ export async function fetchTranscriptMeta(videoId: string): Promise<TranscriptRe
     body: JSON.stringify({ videoId }),
   });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: "Failed to fetch transcript" }));
-    throw new Error(err.error || "Failed to fetch transcript");
+    const err = await res.json().catch(() => ({}));
+    throw new TranscriptLookupError(
+      err.error || "Failed to look up captions for this video.",
+      (err.code as TranscriptErrorCode) || "unknown"
+    );
   }
   return res.json();
 }
