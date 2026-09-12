@@ -7,6 +7,7 @@ import {
   formatTranscriptText,
 } from "../src/lib/ai.ts";
 import { extractJsonObject, normaliseShorts } from "../api/viral.js";
+import { classifyWatchPage } from "../api/_lib.js";
 
 group("XML caption parsing");
 {
@@ -123,6 +124,60 @@ group("Model configuration");
     JSON.stringify(lib.MODELS));
   check("no task still points at the old expensive model",
     !Object.values(lib.MODELS).includes("~openai/gpt-mini-latest"), JSON.stringify(lib.MODELS));
+}
+
+group("Watch-page classification (F08 decision table)");
+{
+  // A real watch page is ~1.4MB. Pad fixtures past the 50KB "is this a real
+  // page" threshold so the size check does not short-circuit the status logic.
+  const pad = " ".repeat(60000);
+  const page = (playability, extra = "") =>
+    `<html>${pad}"playabilityStatus":{${playability}}${extra}</html>`;
+  const tracks = `,"captionTracks":[{"baseUrl":"https://x/t","languageCode":"en","name":{"simpleText":"English"}}]`;
+
+  check("healthy page with captions -> ok",
+    classifyWatchPage(200, page('"status":"OK"', tracks)).kind === "ok");
+
+  check("healthy page with no caption tracks -> none",
+    classifyWatchPage(200, page('"status":"OK"')).kind === "none");
+
+  // Measured on the live site: jNQXAC9IVRw, a public and perfectly available
+  // video, returns exactly this to a datacenter IP.
+  const botCheck = classifyWatchPage(200,
+    page('"status":"LOGIN_REQUIRED","reason":"Sign in to confirm you\u2019re not a bot"'));
+  check("LOGIN_REQUIRED + 'not a bot' -> blocked, NOT unavailable",
+    botCheck.kind === "blocked",
+    `got "${botCheck.kind}" — calling YouTube's bot check a private video sends the user after the wrong problem`);
+
+  check("LOGIN_REQUIRED + a real reason -> unavailable",
+    classifyWatchPage(200,
+      page('"status":"LOGIN_REQUIRED","reason":"This video is private"')).kind === "unavailable");
+
+  const gone = classifyWatchPage(200,
+    page('"status":"ERROR","reason":"This video is unavailable"'));
+  check("ERROR -> unavailable", gone.kind === "unavailable");
+  check("passes YouTube's own wording through",
+    gone.detail.includes("This video is unavailable"), `detail: ${gone.detail}`);
+
+  check("UNPLAYABLE -> unavailable",
+    classifyWatchPage(200, page('"status":"UNPLAYABLE","reason":"Not available in your country"')).kind === "unavailable");
+
+  check("AGE_VERIFICATION_REQUIRED -> unavailable",
+    classifyWatchPage(200, page('"status":"AGE_VERIFICATION_REQUIRED"')).kind === "unavailable");
+
+  check("HTTP 429 -> throttled", classifyWatchPage(429, "").kind === "throttled");
+  check("HTTP 403 -> throttled", classifyWatchPage(403, "").kind === "throttled");
+  check("HTTP 404 -> unavailable", classifyWatchPage(404, "").kind === "unavailable");
+  check("HTTP 503 -> transient", classifyWatchPage(503, "").kind === "transient");
+
+  // A throttle response measured 3.2KB against a real page's 1.4MB.
+  check("200 with a tiny body -> throttled, not 'no captions'",
+    classifyWatchPage(200, "<html>blocked</html>").kind === "throttled",
+    "a few KB never contained a player response, whatever the status code");
+
+  check("the word UNPLAYABLE elsewhere on a healthy page is ignored",
+    classifyWatchPage(200, page('"status":"OK"', tracks + ',"someOtherField":"UNPLAYABLE"')).kind === "ok",
+    "reads playabilityStatus specifically instead of scanning 1.4MB for keywords");
 }
 
 summarise("Units");

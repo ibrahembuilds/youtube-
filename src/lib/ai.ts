@@ -41,6 +41,7 @@ export interface TranscriptResult {
  */
 export type TranscriptErrorCode =
   | "throttled"
+  | "bot_check"
   | "no_captions"
   | "unavailable"
   | "upstream_error"

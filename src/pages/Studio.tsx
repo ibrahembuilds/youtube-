@@ -94,7 +94,9 @@ export default function Studio() {
       // Rate limiting clears on its own; no captions never will.
       setErrorIsRetryable(
         err instanceof TranscriptLookupError &&
-          (err.code === "throttled" || err.code === "upstream_error")
+          (err.code === "throttled" ||
+            err.code === "bot_check" ||
+            err.code === "upstream_error")
       );
       setLoading(false);
       return;
