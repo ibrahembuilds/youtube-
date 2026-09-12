@@ -4,6 +4,26 @@ const _env = typeof process !== "undefined" ? process.env : {};
 const _key = _env["OPENROUTER" + "_API_KEY"] || "";
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 
+// ─── Model selection ──────────────────────────────────────────────────
+// One model per task, each overridable by env var so you can retune cost or
+// quality without a deploy. Prices below are USD per 1M tokens, read from
+// OpenRouter on 2026-09-12.
+//
+//   gpt-5-nano  $0.05 in / $0.40 out / $0.005 cached   cheap, 400k context
+//   gpt-5-mini  $0.25 in / $2.00 out / $0.025 cached   used where output
+//                                                      quality actually bites
+//
+// Viral shorts and translation keep the stronger model on purpose: viral must
+// return strictly parseable JSON, and translation has to hold tone across 19
+// languages. Those are exactly where the cheapest models fail. Point them at
+// gpt-5-nano (or deepseek/deepseek-v4-flash) if you want to test that trade.
+export const MODELS = {
+  chat: _env.AI_MODEL_CHAT || "openai/gpt-5-nano",
+  summary: _env.AI_MODEL_SUMMARY || "openai/gpt-5-nano",
+  viral: _env.AI_MODEL_VIRAL || "openai/gpt-5-mini",
+  translate: _env.AI_MODEL_TRANSLATE || "openai/gpt-5-mini",
+};
+
 // ─── Request guard: CORS, method, rate limit, body ────────────────────
 // These endpoints proxy a paid AI provider, so they are only as safe as the
 // gate in front of them. Note what each control actually buys you:
@@ -209,59 +229,177 @@ function mapCaptionTracks(tracksJson) {
 }
 
 /**
- * Fetch the YouTube watch page and extract caption track metadata from the
- * embedded player response. Returns null (not an error) if no caption data
- * is present in the page — that can mean the video genuinely has none, OR
- * that YouTube served a cookie-consent interstitial instead of the real
- * page (common for datacenter IPs, like cloud hosts). The CONSENT cookie
- * below answers that prompt so the real page comes back.
+ * A failure the caller can act on. `code` distinguishes outcomes that the old
+ * single error message conflated — "YouTube blocked us" and "this video has no
+ * captions" need completely different responses from the user.
+ */
+export class TranscriptError extends Error {
+  constructor(code, message, statusCode, retryAfter = null) {
+    super(message);
+    this.name = "TranscriptError";
+    this.code = code;
+    this.statusCode = statusCode;
+    this.retryAfter = retryAfter;
+  }
+}
+
+// A real watch page is well over a megabyte. Throttle responses, consent
+// interstitials and bot checks are a few KB — measured at ~3.2KB for a 429.
+// Anything this small did not contain a player response, whatever its status.
+const MIN_REAL_PAGE_BYTES = 50000;
+
+const CACHE_TTL_MS = Number(_env.TRANSCRIPT_CACHE_TTL_MS || 30 * 60 * 1000);
+const transcriptCache = new Map();
+
+function cacheGet(videoId) {
+  const hit = transcriptCache.get(videoId);
+  if (!hit) return null;
+  if (Date.now() >= hit.expires) {
+    transcriptCache.delete(videoId);
+    return null;
+  }
+  return hit.value;
+}
+
+function cacheSet(videoId, value) {
+  if (transcriptCache.size > 500) {
+    const now = Date.now();
+    for (const [key, entry] of transcriptCache) {
+      if (now >= entry.expires) transcriptCache.delete(key);
+    }
+  }
+  transcriptCache.set(videoId, { value, expires: Date.now() + CACHE_TTL_MS });
+}
+
+/**
+ * Fetch the watch page and classify what came back. Returns a discriminated
+ * result rather than null-for-everything, so the caller knows whether retrying
+ * could possibly help.
  */
 async function fetchCaptionsFromWatchPage(videoId) {
-  const res = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-    headers: {
-      "User-Agent": USER_AGENT,
-      "Accept-Language": "en-US,en;q=0.9,ar;q=0.8,zh;q=0.7,es;q=0.6,fr;q=0.5",
-      "Cookie": "CONSENT=YES+1",
-    },
-  });
+  let res;
+  try {
+    res = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+      headers: {
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "en-US,en;q=0.9,ar;q=0.8,zh;q=0.7,es;q=0.6,fr;q=0.5",
+        Cookie: "CONSENT=YES+1",
+      },
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch (err) {
+    return { kind: "transient", detail: `request failed: ${err.message}` };
+  }
+
+  // Previously the status was never inspected, so a 429 was indistinguishable
+  // from a video with no captions.
+  if (res.status === 429 || res.status === 403) {
+    return { kind: "throttled", detail: `YouTube returned HTTP ${res.status}` };
+  }
+  if (res.status >= 500) {
+    return { kind: "transient", detail: `YouTube returned HTTP ${res.status}` };
+  }
+  if (res.status === 404) {
+    return { kind: "unavailable", detail: "That video does not exist." };
+  }
+  if (!res.ok) {
+    return { kind: "transient", detail: `YouTube returned HTTP ${res.status}` };
+  }
 
   const html = await res.text();
 
+  if (html.length < MIN_REAL_PAGE_BYTES) {
+    return {
+      kind: "throttled",
+      detail: `YouTube served a ${html.length}-byte page instead of the video page`,
+    };
+  }
+
+  if (/"status":"(LOGIN_REQUIRED|UNPLAYABLE|ERROR)"/.test(html)) {
+    return {
+      kind: "unavailable",
+      detail: "That video is private, age-restricted, or unavailable.",
+    };
+  }
+
   const captionIdx = html.indexOf('"captionTracks":');
-  if (captionIdx < 0) return null;
+  if (captionIdx < 0) {
+    // A full page with a player response but no caption tracks really does
+    // mean the video has none.
+    return { kind: "none" };
+  }
 
   const openBracket = html.indexOf("[", captionIdx);
-  if (openBracket < 0) return null;
-
-  const balanced = extractBalancedJson(html, openBracket);
-  if (!balanced) return null;
+  const balanced = openBracket < 0 ? null : extractBalancedJson(html, openBracket);
+  if (!balanced) return { kind: "transient", detail: "caption data was malformed" };
 
   let tracksJson;
   try {
     tracksJson = JSON.parse(balanced);
   } catch {
-    return null;
+    return { kind: "transient", detail: "caption data did not parse" };
   }
 
-  if (!Array.isArray(tracksJson) || tracksJson.length === 0) return null;
+  if (!Array.isArray(tracksJson) || tracksJson.length === 0) return { kind: "none" };
 
-  return mapCaptionTracks(tracksJson);
+  return { kind: "ok", tracks: mapCaptionTracks(tracksJson) };
 }
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 /**
- * Fetch caption track metadata (URLs only) for a video. Retries once on
- * failure — YouTube occasionally serves a transient interstitial that
- * clears up on a second request.
+ * Fetch caption track metadata for a video.
+ *
+ * Retries only outcomes a retry could fix, and backs off between attempts —
+ * the old version fired two identical requests back to back, which is the
+ * worst possible move when the reason for failure is rate limiting.
  */
 export async function fetchAllTranscripts(videoId) {
-  const attempt1 = await fetchCaptionsFromWatchPage(videoId).catch(() => null);
-  if (attempt1) return { tracks: attempt1, source: "youtube_page_urls" };
+  const cached = cacheGet(videoId);
+  if (cached) return { ...cached, cached: true };
 
-  const attempt2 = await fetchCaptionsFromWatchPage(videoId).catch(() => null);
-  if (attempt2) return { tracks: attempt2, source: "youtube_page_urls" };
+  const backoffMs = [0, 700, 2000];
+  let last = null;
 
-  throw new Error(
-    "Couldn't retrieve captions for this video. Either it has none, or YouTube is temporarily blocking this request — try again in a moment, or try a different video."
+  for (const wait of backoffMs) {
+    if (wait) await sleep(wait);
+    last = await fetchCaptionsFromWatchPage(videoId);
+
+    if (last.kind === "ok") {
+      const value = { tracks: last.tracks, source: "youtube_page_urls" };
+      cacheSet(videoId, value);
+      return value;
+    }
+    // Retrying will not conjure captions that do not exist, and will not
+    // un-private a video.
+    if (last.kind === "none" || last.kind === "unavailable") break;
+  }
+
+  if (last.kind === "none") {
+    throw new TranscriptError(
+      "no_captions",
+      "This video has no captions, so there is nothing to transcribe, chat with or summarise. Try a video that shows a CC badge on YouTube.",
+      422
+    );
+  }
+
+  if (last.kind === "unavailable") {
+    throw new TranscriptError("unavailable", last.detail, 422);
+  }
+
+  if (last.kind === "throttled") {
+    throw new TranscriptError(
+      "throttled",
+      "YouTube is rate-limiting this server right now — this is not a problem with the video. Wait about a minute and try again.",
+      429,
+      60
+    );
+  }
+
+  throw new TranscriptError(
+    "upstream_error",
+    `Could not reach YouTube to look up captions (${last?.detail || "unknown error"}). Try again in a moment.`,
+    502
   );
 }
 
@@ -327,37 +465,42 @@ export async function translateTranscript(segments, targetLanguage) {
 }
 
 async function translateChunk(text, targetLanguage) {
-  const res = await fetch(OPENROUTER_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${_key}`,
-      "HTTP-Referer": "https://yt-studio.vercel.app",
-      "X-Title": "YT Studio",
-    },
-    body: JSON.stringify({
-      model: "~openai/gpt-mini-latest",
-      messages: [
-        {
-          role: "system",
-          content: `You are a professional translator. Translate the following text to ${targetLanguage}. Preserve ALL meaning, tone, and nuance. Return ONLY the translated text — no explanations, no notes, no quotation marks.`,
-        },
-        { role: "user", content: text },
-      ],
-      temperature: 0.3,
-      max_tokens: 4096,
-    }),
-  });
-
-  if (!res.ok) throw new Error(`Translation failed: ${await res.text()}`);
-  const data = await res.json();
-  return data.choices[0].message.content.trim();
+  const content = await callAI(
+    [
+      {
+        role: "system",
+        content: `You are a professional translator. Translate the following text to ${targetLanguage}. Preserve ALL meaning, tone, and nuance. Return ONLY the translated text — no explanations, no notes, no quotation marks.`,
+      },
+      { role: "user", content: text },
+    ],
+    { model: MODELS.translate, maxTokens: 4096 }
+  );
+  return content.trim();
 }
 
 // ─── AI Chat ───────────────────────────────────────────────────────────
 
-export async function callAI(messages, model = "~openai/gpt-mini-latest") {
+export async function callAI(messages, options = {}) {
   if (!_key) throw new Error("API key not configured");
+
+  const {
+    model = MODELS.chat,
+    maxTokens = 4000,
+    temperature,
+    json = false,
+  } = options;
+
+  const payload = { model, messages, max_tokens: maxTokens };
+
+  // Only send temperature when a caller asks for it. Several models — including
+  // every gpt-5 tier — do not accept the parameter at all, so sending it blindly
+  // (as this code used to) just gets it dropped and creates a false impression
+  // that output randomness is being controlled.
+  if (typeof temperature === "number") payload.temperature = temperature;
+
+  // Ask the provider to guarantee syntactically valid JSON. This is the real
+  // control for structured output, and it works on models where temperature does not.
+  if (json) payload.response_format = { type: "json_object" };
 
   const res = await fetch(OPENROUTER_URL, {
     method: "POST",
@@ -367,10 +510,18 @@ export async function callAI(messages, model = "~openai/gpt-mini-latest") {
       "HTTP-Referer": "https://yt-studio.vercel.app",
       "X-Title": "YT Studio",
     },
-    body: JSON.stringify({ model, messages, temperature: 0.7, max_tokens: 4000 }),
+    body: JSON.stringify(payload),
   });
 
   if (!res.ok) throw new Error(`AI request failed: ${await res.text()}`);
   const data = await res.json();
-  return data.choices[0].message.content;
+
+  // OpenRouter can answer 200 with an error body and no choices — on a
+  // moderation block, an upstream provider failure, or exhausted credit.
+  // Reading data.choices[0] blindly turns that into a raw TypeError.
+  const content = data?.choices?.[0]?.message?.content;
+  if (typeof content !== "string") {
+    throw new Error(data?.error?.message || "The AI provider returned no completion.");
+  }
+  return content;
 }

@@ -5,7 +5,7 @@ import { extractVideoId, getEmbedUrl, getThumbnail, fetchVideoInfo, type VideoIn
 import {
   fetchTranscriptMeta, fetchAllTranscriptContent, fetchTranscriptContent,
   translateTranscript, chatWithVideo, generateSummary, generateViralShorts,
-  getDownloadInfo, formatTranscriptText,
+  getDownloadInfo, formatTranscriptText, TranscriptLookupError,
   type ChatMessage, type TranscriptSegment, type TranscriptResult,
   type TranscriptTrack, type ViralShort, type DownloadInfo,
 } from "@/lib/ai";
@@ -29,6 +29,7 @@ export default function Studio() {
   const [loading, setLoading] = useState(false);
   const [loadingTranscript, setLoadingTranscript] = useState(false);
   const [error, setError] = useState("");
+  const [errorIsRetryable, setErrorIsRetryable] = useState(false);
   const [activeTab, setActiveTab] = useState<Tab>("watch");
 
   // Chat state
@@ -61,6 +62,7 @@ export default function Studio() {
 
   async function handleLoad() {
     setError("");
+    setErrorIsRetryable(false);
     const id = extractVideoId(url);
     if (!id) { setError("Please enter a valid YouTube URL"); return; }
 
@@ -89,6 +91,11 @@ export default function Studio() {
     if (metaResult.status === "rejected") {
       const err: any = metaResult.reason;
       setError(err.message || "Something went wrong");
+      // Rate limiting clears on its own; no captions never will.
+      setErrorIsRetryable(
+        err instanceof TranscriptLookupError &&
+          (err.code === "throttled" || err.code === "upstream_error")
+      );
       setLoading(false);
       return;
     }
@@ -250,7 +257,20 @@ export default function Studio() {
               {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : "Load Video"}
             </button>
           </div>
-          {error && <p className="mt-3 text-sm text-red-500">{error}</p>}
+          {error && (
+            <div className="mt-3 flex items-start gap-3">
+              <p className="text-sm text-red-500">{error}</p>
+              {errorIsRetryable && (
+                <button
+                  onClick={handleLoad}
+                  disabled={loading}
+                  className="btn-ghost text-xs border border-ink-200 shrink-0"
+                >
+                  Try again
+                </button>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Language selector */}

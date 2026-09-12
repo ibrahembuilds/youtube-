@@ -6,6 +6,7 @@ import {
   parseTranscriptJson3,
   formatTranscriptText,
 } from "../src/lib/ai.ts";
+import { extractJsonObject, normaliseShorts } from "../api/viral.js";
 
 group("XML caption parsing");
 {
@@ -73,6 +74,55 @@ group("Transcript text sent to the AI");
   check("caps the payload at 50k chars", truncated.length <= 50000, `got ${truncated.length}`);
   check("tells the caller it truncated", false,
     `kept ${truncated.split("\n").length - 1} of ${many.length} segments and returns a bare string — the UI cannot tell`, "F13");
+}
+
+group("Viral shorts — surviving a cheaper model's output");
+{
+  const good = '{"shorts":[{"title":"A","script":"B"}]}';
+  check("parses clean json", extractJsonObject(good)?.shorts?.length === 1);
+
+  check("strips a markdown fence",
+    extractJsonObject('```json\n' + good + '\n```')?.shorts?.length === 1,
+    "models wrap json in fences even when asked not to");
+
+  check("survives preamble and trailing prose",
+    extractJsonObject('Sure! Here you go:\n' + good + '\nHope that helps.')?.shorts?.length === 1,
+    "scans for the first balanced object instead of trusting the whole string");
+
+  check("handles braces inside strings",
+    extractJsonObject('{"shorts":[{"title":"use {curly} braces","script":"B"}]}')?.shorts?.[0]?.title
+      === "use {curly} braces");
+
+  check("returns null for truncated json, rather than throwing",
+    extractJsonObject('{"shorts":[{"title":"A","scr') === null,
+    "a truncated response must fail cleanly so the handler can return 502");
+
+  check("returns null for no json at all",
+    extractJsonObject("I could not find any good clips.") === null);
+
+  const messy = normaliseShorts({ shorts: [
+    { title: "Good", script: "S", viralScore: "150", startTime: "12.5", captions: "not-an-array", hashtags: ["#a", 7] },
+    { title: "Missing script" },
+    null,
+  ]});
+  check("drops entries the UI cannot render", messy.length === 1, `kept ${messy.length}`);
+  check("clamps viralScore into 0-100", messy[0].viralScore === 100, `got ${messy[0].viralScore}`);
+  check("coerces numeric strings", messy[0].startTime === 12.5, `got ${messy[0].startTime}`);
+  check("forces captions/hashtags to clean arrays",
+    Array.isArray(messy[0].captions) && messy[0].captions.length === 0 && messy[0].hashtags.length === 1,
+    JSON.stringify({ c: messy[0].captions, h: messy[0].hashtags }));
+}
+
+group("Model configuration");
+{
+  const lib = await import("../api/_lib.js");
+  check("every task has a model", ["chat", "summary", "viral", "translate"].every((k) => !!lib.MODELS[k]),
+    JSON.stringify(lib.MODELS));
+  check("defaults are the cheap tier for chat and summary",
+    lib.MODELS.chat === "openai/gpt-5-nano" && lib.MODELS.summary === "openai/gpt-5-nano",
+    JSON.stringify(lib.MODELS));
+  check("no task still points at the old expensive model",
+    !Object.values(lib.MODELS).includes("~openai/gpt-mini-latest"), JSON.stringify(lib.MODELS));
 }
 
 summarise("Units");

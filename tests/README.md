@@ -38,9 +38,9 @@ both directions:
 - a **tagged** check that passes reports `FIXED` → remove the tag
 
 Open tags: F04 (json3 timestamps), F05 (summary type), F06 (hour timestamps),
-F07 (double-escaped entities), F08 (throttling vs. no captions), F10 (badge
-honesty), F11 (chat gating), F12 (download links), F13 (silent truncation),
-F16 (attribute-order parsing), F17 (no 404 route).
+F07 (double-escaped entities), F10 (badge honesty), F11 (chat gating),
+F12 (download links), F13 (silent truncation), F16 (attribute-order parsing),
+F17 (no 404 route).
 
 ## Browser binary
 
@@ -50,5 +50,6 @@ F16 (attribute-order parsing), F17 (no 404 route).
 ## Network
 
 `test:unit` and `test:e2e` are hermetic — every external host is stubbed.
-`test:api` includes one live call to YouTube; when YouTube throttles the
-request it reports as the `F08` known issue rather than failing the run.
+`test:api` makes live calls to YouTube. Those checks assert that whatever
+comes back is *classified* — throttling, no captions, unavailable video — so
+the suite passes whether or not YouTube is rate-limiting at the time.

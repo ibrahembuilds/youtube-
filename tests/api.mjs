@@ -119,17 +119,45 @@ try {
       `got ${bigSegs.status} ${bigSegs.text.slice(0, 90)}`);
   }
 
-  group("Live YouTube path (network-dependent)");
+  group("F08 — caption lookup failures are distinguishable");
   {
+    const bad = await post(PORT, "transcript", { videoId: "not-an-id" });
+    check("a malformed video id is rejected before any network call",
+      bad.status === 400, `got ${bad.status} ${bad.text.slice(0, 90)}`);
+
+    // An id that is well-formed but does not exist.
+    const missing = await post(PORT, "transcript", { videoId: "ZZZZZZZZZZZ" });
+    check("a missing/private video reports 'unavailable', not 'no captions'",
+      missing.status === 422 && missing.json?.code === "unavailable",
+      `got ${missing.status} ${missing.text.slice(0, 120)}`);
+
     const r = await post(PORT, "transcript", { videoId: "dQw4w9WgXcQ" });
+
+    // Whichever branch the network puts us in, the response must say WHICH.
+    check("every failure mode carries a machine-readable code",
+      r.status === 200 || typeof r.json?.code === "string",
+      `got ${r.status} with no code field: ${r.text.slice(0, 120)}`);
+
     if (r.status === 200) {
       check("returns caption tracks with urls",
         Array.isArray(r.json?.tracks) && r.json.tracks.length > 0 && !!r.json.tracks[0].transcriptUrl,
         JSON.stringify(r.json).slice(0, 120));
+
+      const again = await post(PORT, "transcript", { videoId: "dQw4w9WgXcQ" });
+      check("a repeat lookup is served from cache, not re-scraped",
+        again.json?.cached === true, `cached=${again.json?.cached}`);
+    } else if (r.json?.code === "throttled") {
+      check("throttling reports 429, separately from 'no captions'",
+        r.status === 429, `got ${r.status}`);
+      check("throttling tells the client when to retry",
+        !!r.headers.get("retry-after"), `Retry-After=${r.headers.get("retry-after")}`);
+      check("the message says it is YouTube, not the video",
+        /rate-limit/i.test(r.json.error) && !/has none/i.test(r.json.error),
+        `message: ${r.json.error}`);
     } else {
-      check("throttled response is distinguishable from 'no captions'", false,
-        `YouTube returned non-200 and the handler collapsed it into a generic message: ${r.text.slice(0, 120)}`,
-        "F08");
+      check("a non-throttle failure is still classified",
+        ["no_captions", "unavailable", "upstream_error"].includes(r.json?.code),
+        `got code=${r.json?.code} status=${r.status}`);
     }
   }
 } finally {

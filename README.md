@@ -15,7 +15,7 @@ Paste a YouTube link. Watch, chat, summarize, and create viral shorts from any v
 - React + Vite + TypeScript
 - Tailwind CSS (clean minimal design)
 - Vercel Serverless Functions (API)
-- OpenRouter for AI (GPT-4o-mini)
+- OpenRouter for AI (model per task, set by env var)
 - YouTube timedtext API for transcripts
 
 ## Setup
@@ -33,6 +33,10 @@ Paste a YouTube link. Watch, chat, summarize, and create viral shorts from any v
 | Variable | Required | Purpose |
 | --- | --- | --- |
 | `OPENROUTER_API_KEY` | yes | Powers chat, summaries, viral shorts and translation. |
+| `AI_MODEL_CHAT` | no | Model for chat (default `openai/gpt-5-nano`). |
+| `AI_MODEL_SUMMARY` | no | Model for summaries (default `openai/gpt-5-nano`). |
+| `AI_MODEL_VIRAL` | no | Model for viral shorts (default `openai/gpt-5-mini`). |
+| `AI_MODEL_TRANSLATE` | no | Model for translation (default `openai/gpt-5-mini`). |
 | `ALLOWED_ORIGINS` | no | Extra browser origins allowed to call `/api/*`. Same-origin is always allowed. |
 | `RATE_LIMIT_MAX` | no | Per-IP requests per window (default 20). |
 | `RATE_LIMIT_WINDOW_MS` | no | Window length in ms (default 60000). |
