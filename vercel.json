@@ -1,10 +1,30 @@
 {
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api/$1" },
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/$1"
+    },
     {
       "source": "/yt-timedtext",
       "destination": "https://www.youtube.com/api/timedtext"
     },
-    { "source": "/(.*)", "destination": "/index.html" }
-  ]
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ],
+  "functions": {
+    "api/viral.js": {
+      "maxDuration": 60
+    },
+    "api/translate.js": {
+      "maxDuration": 60
+    },
+    "api/summary.js": {
+      "maxDuration": 30
+    },
+    "api/chat.js": {
+      "maxDuration": 30
+    }
+  }
 }

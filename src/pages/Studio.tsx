@@ -1,23 +1,60 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { Play, Sparkles, MessageCircle, Download, Scissors, Loader2, Send, FileText, List, CheckCircle, Clock, Globe, Languages } from "lucide-react";
 import { extractVideoId, getEmbedUrl, getThumbnail, fetchVideoInfo, type VideoInfo } from "@/lib/youtube";
 import {
   fetchTranscriptMeta, fetchAllTranscriptContent, fetchTranscriptContent,
   translateTranscript, chatWithVideo, generateSummary, generateViralShorts,
-  getDownloadInfo, formatTranscriptText, TranscriptLookupError,
+  getDownloadInfo, formatTranscriptText, formatTimestamp, transcriptCoverage, TranscriptLookupError,
   type ChatMessage, type TranscriptSegment, type TranscriptResult,
   type TranscriptTrack, type ViralShort, type DownloadInfo,
 } from "@/lib/ai";
 
 type Tab = "watch" | "transcript" | "chat" | "summary" | "viral" | "download";
 
-const SUPPORTED_LANGUAGES = [
-  "Arabic", "Chinese (Simplified)", "Chinese (Traditional)", "Dutch",
-  "English", "French", "German", "Hindi", "Indonesian", "Italian",
-  "Japanese", "Korean", "Malay", "Portuguese", "Russian", "Spanish",
-  "Thai", "Turkish", "Vietnamese",
+// Paired with a language code, because the only reliable way to tell "this is
+// already the transcript's language" is to compare codes. A track's display
+// name carries qualifiers ("Portuguese (Brazil)", "English (auto-generated)")
+// that never match a plain list entry.
+const SUPPORTED_LANGUAGES: { name: string; code: string }[] = [
+  { name: "Arabic", code: "ar" },
+  { name: "Chinese (Simplified)", code: "zh" },
+  { name: "Chinese (Traditional)", code: "zh" },
+  { name: "Dutch", code: "nl" },
+  { name: "English", code: "en" },
+  { name: "French", code: "fr" },
+  { name: "German", code: "de" },
+  { name: "Hindi", code: "hi" },
+  { name: "Indonesian", code: "id" },
+  { name: "Italian", code: "it" },
+  { name: "Japanese", code: "ja" },
+  { name: "Korean", code: "ko" },
+  { name: "Malay", code: "ms" },
+  { name: "Portuguese", code: "pt" },
+  { name: "Russian", code: "ru" },
+  { name: "Spanish", code: "es" },
+  { name: "Thai", code: "th" },
+  { name: "Turkish", code: "tr" },
+  { name: "Vietnamese", code: "vi" },
 ];
+
+/** Base language code, so "pt-BR" and "pt" compare equal. */
+function baseCode(code: string | undefined): string {
+  return (code || "").toLowerCase().split(/[-_]/)[0];
+}
+
+/** The language the viewer most likely wants, that is not the transcript's own. */
+function defaultTargetLanguage(trackCode: string | undefined): string {
+  const track = baseCode(trackCode);
+  const preferred = typeof navigator !== "undefined" ? navigator.languages || [navigator.language] : [];
+  for (const tag of preferred) {
+    const hit = SUPPORTED_LANGUAGES.find((l) => l.code === baseCode(tag));
+    if (hit && hit.code !== track) return hit.name;
+  }
+  return (SUPPORTED_LANGUAGES.find((l) => l.code !== track) || SUPPORTED_LANGUAGES[0]).name;
+}
+
+const EMPTY_SEGMENTS: TranscriptSegment[] = [];
 
 export default function Studio() {
   const [url, setUrl] = useState("");
@@ -56,9 +93,38 @@ export default function Studio() {
   const [translating, setTranslating] = useState(false);
 
   // Derived state
-  const selectedSegments = trackSegments.get(selectedTrackIndex) || [];
+  // Memoised because the `|| []` fallback would otherwise hand downstream
+  // hooks a brand-new array on every render.
+  const selectedSegments = useMemo(
+    () => trackSegments.get(selectedTrackIndex) ?? EMPTY_SEGMENTS,
+    [trackSegments, selectedTrackIndex]
+  );
   const selectedTrack = transcriptMeta?.tracks?.[selectedTrackIndex] ?? null;
   const transcriptText = formatTranscriptText(selectedSegments);
+
+  const trackCode = selectedTrack?.languageCode;
+
+  // The AI context is capped, so on a long video the summary and shorts are
+  // built from only the opening stretch. Silently returning a partial answer
+  // reads as a complete one, so say what was covered.
+  const coverage = useMemo(() => transcriptCoverage(selectedSegments), [selectedSegments]);
+
+  // Translating a transcript into its own language is a no-op, and the button
+  // for it is disabled. Defaulting the dropdown to "English" therefore left the
+  // whole feature dead on arrival for every English video — which is most of
+  // them. Move off the transcript's own language as soon as it is known.
+  useEffect(() => {
+    if (!trackCode) return;
+    setTargetLanguage((current) => {
+      const currentCode = SUPPORTED_LANGUAGES.find((l) => l.name === current)?.code;
+      return currentCode === baseCode(trackCode) ? defaultTargetLanguage(trackCode) : current;
+    });
+  }, [trackCode]);
+
+  const targetIsSameLanguage = useMemo(() => {
+    const targetCode = SUPPORTED_LANGUAGES.find((l) => l.name === targetLanguage)?.code;
+    return !!targetCode && targetCode === baseCode(trackCode);
+  }, [targetLanguage, trackCode]);
 
   async function handleLoad() {
     setError("");
@@ -94,7 +160,9 @@ export default function Studio() {
       // Rate limiting clears on its own; no captions never will.
       setErrorIsRetryable(
         err instanceof TranscriptLookupError &&
-          (err.code === "throttled" || err.code === "upstream_error")
+          (err.code === "throttled" ||
+            err.code === "bot_check" ||
+            err.code === "upstream_error")
       );
       setLoading(false);
       return;
@@ -336,6 +404,13 @@ export default function Studio() {
 
             <div className="min-h-[400px]">
               {activeTab === "watch" && <WatchTab videoId={videoId} videoInfo={videoInfo} selectedTrack={selectedTrack} segmentCount={selectedSegments.length} />}
+              {coverage.truncated && activeTab !== "watch" && activeTab !== "download" && (
+                <div className="mb-4 badge bg-amber-50 text-amber-700">
+                  <Clock className="w-3 h-3" />
+                  AI reads the first {formatTimestamp(coverage.lastIncludedStart)} of this video
+                  ({coverage.includedSegments} of {coverage.totalSegments} segments)
+                </div>
+              )}
               {activeTab === "transcript" && (
                 <TranscriptTab
                   segments={selectedSegments}
@@ -346,6 +421,7 @@ export default function Studio() {
                   setTargetLanguage={setTargetLanguage}
                   onTranslate={handleTranslate}
                   translating={translating}
+                  targetIsSameLanguage={targetIsSameLanguage}
                   onClearTranslation={() => setTranslatedText("")}
                 />
               )}
@@ -414,11 +490,13 @@ function WatchTab({ videoId, videoInfo, selectedTrack, segmentCount }: {
 }
 
 function TranscriptTab({
-  segments, track, loading, translatedText, targetLanguage, setTargetLanguage, onTranslate, translating, onClearTranslation,
+  segments, track, loading, translatedText, targetLanguage, setTargetLanguage, onTranslate, translating,
+  onClearTranslation, targetIsSameLanguage,
 }: {
   segments: TranscriptSegment[]; track: TranscriptTrack | null; loading: boolean;
   translatedText: string; targetLanguage: string; setTargetLanguage: (v: string) => void;
   onTranslate: () => void; translating: boolean; onClearTranslation: () => void;
+  targetIsSameLanguage: boolean;
 }) {
   if (loading) {
     return (
@@ -456,12 +534,28 @@ function TranscriptTab({
             <span className="text-sm font-medium">{track.languageName}{track.kind === "asr" && <span className="text-ink-400 font-normal ml-1">(auto-generated)</span>}</span>
             <span className="text-xs text-ink-400">• {segments.length} segments</span>
           </div>
-          <div className="flex items-center gap-2 ml-auto">
-            <span className="text-sm text-ink-400 flex items-center gap-1"><Languages className="w-3.5 h-3.5" />Translate to:</span>
-            <select value={targetLanguage} onChange={(e) => setTargetLanguage(e.target.value)} className="text-sm border border-ink-200 rounded-lg px-2 py-1.5 bg-white">
-              {SUPPORTED_LANGUAGES.map((lang) => <option key={lang} value={lang}>{lang}</option>)}
+          {/* Wraps at phone width — unwrapped, this row pushed the Translate
+              button 10px past a 390px viewport, where it could not be tapped. */}
+          <div className="flex items-center gap-2 flex-wrap w-full sm:w-auto sm:ml-auto">
+            <span className="text-sm text-ink-400 flex items-center gap-1">
+              <Languages className="w-3.5 h-3.5" />Translate to:
+            </span>
+            <select
+              id="translate-target"
+              value={targetLanguage}
+              onChange={(e) => setTargetLanguage(e.target.value)}
+              className="text-sm border border-ink-200 rounded-lg px-2 py-1.5 bg-white min-w-0 flex-1 sm:flex-none"
+            >
+              {SUPPORTED_LANGUAGES.map((lang) => (
+                <option key={lang.name} value={lang.name}>{lang.name}</option>
+              ))}
             </select>
-            <button onClick={onTranslate} disabled={translating || targetLanguage === track.languageName} className="btn-primary text-xs py-1.5 px-3">
+            <button
+              onClick={onTranslate}
+              disabled={translating || targetIsSameLanguage}
+              title={targetIsSameLanguage ? `This transcript is already in ${targetLanguage}` : undefined}
+              className="btn-primary text-xs py-1.5 px-3 whitespace-nowrap"
+            >
               {translating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : "Translate"}
             </button>
           </div>
@@ -475,13 +569,30 @@ function TranscriptTab({
       </div>
       <div className="card p-6">
         <div className="max-h-[600px] overflow-y-auto">
-          <div className="whitespace-pre-wrap text-sm text-ink-700 leading-relaxed font-mono">
-            {translatedText || segments.map((s) => {
-              const m = Math.floor(s.start / 60);
-              const sec = Math.floor(s.start % 60);
-              return `[${m}:${sec.toString().padStart(2, "0")}] ${s.text}`;
-            }).join("\n")}
-          </div>
+          {translatedText ? (
+            // dir="auto" lets the browser pick the paragraph direction from the
+            // text itself, so an Arabic or Hebrew translation reads correctly
+            // instead of being laid out left-to-right.
+            <p dir="auto" className="whitespace-pre-wrap text-sm text-ink-700 leading-relaxed">
+              {translatedText}
+            </p>
+          ) : (
+            // One row per segment rather than a single pre-wrapped string.
+            // As one string the timestamp became part of the line's bidi run,
+            // which pushed [0:00] to the visual END of every right-to-left
+            // line. Separating the cells keeps timestamps in a left column for
+            // every script, and lets each caption lay itself out.
+            <div className="text-sm text-ink-700 leading-relaxed">
+              {segments.map((seg, i) => (
+                <div key={i} className="flex gap-3 py-0.5">
+                  <span className="shrink-0 text-ink-400 font-mono text-xs pt-0.5 tabular-nums select-none">
+                    {formatTimestamp(seg.start)}
+                  </span>
+                  <span dir="auto" className="min-w-0 flex-1">{seg.text}</span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -565,7 +676,7 @@ function ViralTab({ shorts, loading, onRegenerate }: { shorts: ViralShort[]; loa
               <div>
                 <h3 className="font-semibold text-base">{short.title}</h3>
                 <div className="flex items-center gap-3 mt-1 text-xs text-ink-400">
-                  <span className="flex items-center gap-1"><Clock className="w-3 h-3" />{fmt(short.startTime)} - {fmt(short.endTime)}</span>
+                  <span className="flex items-center gap-1"><Clock className="w-3 h-3" />{formatTimestamp(short.startTime)} - {formatTimestamp(short.endTime)}</span>
                   <span className={`badge ${short.viralScore >= 80 ? "bg-green-50 text-green-600" : "bg-amber-50 text-amber-600"}`}>Viral score: {short.viralScore}/100</span>
                 </div>
               </div>
@@ -586,29 +697,87 @@ function ViralTab({ shorts, loading, onRegenerate }: { shorts: ViralShort[]; loa
 }
 
 function DownloadTab({ info, loading }: { info: DownloadInfo | null; loading: boolean }) {
-  if (loading) return <div className="flex items-center gap-3 text-ink-400"><Loader2 className="w-5 h-5 animate-spin" /><span className="text-sm">Getting download options...</span></div>;
+  const [copied, setCopied] = useState(false);
+
+  if (loading) {
+    return (
+      <div className="flex items-center gap-3 text-ink-400">
+        <Loader2 className="w-5 h-5 animate-spin" />
+        <span className="text-sm">Getting download options...</span>
+      </div>
+    );
+  }
   if (!info) return null;
+
+  async function copyLink() {
+    try {
+      await navigator.clipboard.writeText(info!.videoUrl);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      setCopied(false);
+    }
+  }
+
   return (
     <div className="max-w-2xl">
+      {/* The download tools below need the video link pasted in, so make
+          copying it one click instead of asking the user to retype it. */}
+      <div className="card p-4 mb-4">
+        <p className="text-xs font-medium text-ink-400 mb-2">VIDEO LINK</p>
+        <div className="flex items-center gap-2">
+          <input
+            id="download-video-url"
+            readOnly
+            value={info.videoUrl}
+            onFocus={(e) => e.currentTarget.select()}
+            className="input flex-1 font-mono text-xs"
+          />
+          <button onClick={copyLink} className="btn-secondary text-xs whitespace-nowrap">
+            {copied ? "Copied" : "Copy"}
+          </button>
+        </div>
+      </div>
+
       <div className="space-y-3">
         {info.options?.map((opt, i) => (
-          <a key={i} href={opt.url} target="_blank" rel="noopener noreferrer" className="card p-4 flex items-center justify-between hover:border-ink-300 transition-colors group">
+          <a
+            key={i}
+            href={opt.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="card p-4 flex items-center justify-between hover:border-ink-300 transition-colors group"
+          >
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 rounded-lg bg-ink-100 flex items-center justify-center">
-                {opt.type === "audio" ? <Sparkles className="w-5 h-5 text-ink-600" /> : opt.type === "external" ? <Play className="w-5 h-5 text-ink-600" /> : <Download className="w-5 h-5 text-ink-600" />}
+                {opt.type === "external" ? (
+                  <Play className="w-5 h-5 text-ink-600" />
+                ) : (
+                  <Download className="w-5 h-5 text-ink-600" />
+                )}
               </div>
-              <div><p className="font-medium text-sm">{opt.label}</p><p className="text-xs text-ink-400">{opt.desc}</p></div>
+              <div>
+                <p className="font-medium text-sm">{opt.label}</p>
+                <p className="text-xs text-ink-400">{opt.desc}</p>
+              </div>
             </div>
-            <span className="text-ink-400 group-hover:text-ink-600 transition-colors">→</span>
+            <span className="text-ink-400 group-hover:text-ink-600 transition-colors">↗</span>
           </a>
         ))}
       </div>
-      <div className="mt-6 p-4 bg-ink-50 rounded-xl"><p className="text-xs text-ink-400">💡 For educational use only — respect YouTube's Terms of Service and creator copyright.</p></div>
+
+      <div className="mt-6 p-4 bg-ink-50 rounded-xl space-y-2">
+        <p className="text-xs text-ink-500">
+          YT Studio cannot download the file itself — YouTube signs and encrypts its
+          media URLs, so the download has to happen in a dedicated tool.
+        </p>
+        <p className="text-xs text-ink-400">
+          💡 For educational use only — respect YouTube's Terms of Service and creator copyright.
+        </p>
+      </div>
     </div>
   );
 }
 
-function fmt(s: number): string {
-  const m = Math.floor(s / 60), sec = Math.floor(s % 60);
-  return `${m}:${sec.toString().padStart(2, "0")}`;
-}
+// Timestamps come from formatTimestamp so every surface agrees, including
+// past the one-hour mark.

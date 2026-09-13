@@ -7,6 +7,7 @@ No framework — three plain Node scripts. `npm test` runs all three.
 | `npm run test:unit` | The caption parsers, imported directly from `src/lib/ai.ts` (Node strips the types, no build step). |
 | `npm run test:api` | `/api/*` contract, CORS, rate limiting and payload caps. Spawns its own `api-server.js` instances, so nothing needs to be running first. |
 | `npm run test:e2e` | Real Chromium against a **production build**, served through the rewrite rules in the project's own `vercel.json`. |
+| `npm run test:lang` | Transcript rendering in Arabic, Hebrew, Japanese, Chinese, Korean, Hindi, Thai and Russian, at desktop and phone width. Asserts that right-to-left captions lay out correctly and that the timestamp column stays on the left. |
 
 ## Why E2E runs against the production build
 
@@ -37,9 +38,7 @@ both directions:
 - an **untagged** check that fails is a regression → non-zero exit
 - a **tagged** check that passes reports `FIXED` → remove the tag
 
-Open tags: F04 (json3 timestamps), F05 (summary type), F06 (hour timestamps),
-F07 (double-escaped entities), F10 (badge honesty), F11 (chat gating),
-F12 (download links), F13 (silent truncation), F16 (attribute-order parsing),
+Open tags: F05 (summary type), F10 (badge honesty), F11 (chat gating),
 F17 (no 404 route).
 
 ## Browser binary

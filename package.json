@@ -10,10 +10,12 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "lint": "eslint .",
-    "test": "npm run test:unit && npm run test:api && npm run test:e2e",
+    "test": "npm run test:unit && npm run test:api && npm run test:e2e && node tests/languages.mjs",
     "test:unit": "node tests/units.mjs",
     "test:api": "node tests/api.mjs",
-    "test:e2e": "npm run build && node tests/e2e.mjs"
+    "test:e2e": "npm run build && node tests/e2e.mjs",
+    "test:lang": "npm run build && node tests/languages.mjs",
+    "check": "node scripts/check-video.mjs"
   },
   "dependencies": {
     "lucide-react": "^0.400.0",

@@ -133,8 +133,10 @@ async function loadVideo(page) {
   await page.waitForTimeout(700);
 }
 
+// The transcript is a list of rows (timestamp cell + caption cell), not one
+// pre-wrapped block, so read the whole scrolling container.
 const transcriptText = (page) =>
-  page.locator(".font-mono").first().textContent().catch(() => "");
+  page.locator(".card.p-6 .overflow-y-auto").first().textContent().catch(() => "");
 
 try {
   group("F01 — routing");
@@ -295,18 +297,96 @@ try {
       "input is shown but Send is a silent no-op — the gate tests selectedTrack, handleChat tests transcriptText", "F11");
     await ctx.close();
   }
+
+  group("F12 — the Download tab does not promise files it cannot deliver");
   {
     const { ctx, page } = await newPage({ sources: { direct: XML } });
     await loadVideo(page);
     await page.click("button:has-text('Download')");
-    await page.waitForTimeout(5000);
+    await page.waitForTimeout(4000);
+
     const links = await page.locator("a[target='_blank']").evaluateAll((els) =>
-      els.map((e) => ({ href: e.href, label: e.querySelector("p")?.textContent })));
-    const mp4 = links.find((l) => /MP4/.test(l.label || ""));
-    const mp3 = links.find((l) => /MP3/.test(l.label || ""));
-    check("video and audio downloads are distinct destinations",
-      !!mp4 && !!mp3 && mp4.href !== mp3.href,
-      `both point at ${mp4?.href} — neither downloads anything`, "F12");
+      els.map((e) => ({ href: e.href, label: e.querySelector("p")?.textContent || "" })));
+
+    // YouTube signs and ciphers its media URLs, so nothing here can hand the
+    // user a file. Labelling a link "Video (MP4)" when it opens a homepage is
+    // the bug — two links that both went to cobalt.tools/ used to claim MP4
+    // and MP3.
+    const fileFormatClaims = links.filter((l) => /\b(MP4|MP3|WEBM|M4A)\b/i.test(l.label));
+    check("no link claims a file format it cannot produce",
+      fileFormatClaims.length === 0,
+      `claiming: ${JSON.stringify(fileFormatClaims.map((l) => l.label))}`);
+
+    const hrefs = links.map((l) => l.href);
+    check("no two options point at the same place",
+      new Set(hrefs).size === hrefs.length, JSON.stringify(hrefs));
+
+    check("the video link is shown so it can be pasted into the tool",
+      (await page.locator("#download-video-url").inputValue()).includes("TEST1234567"),
+      "the external tool needs the url, so the app must surface it");
+
+    check("there is a copy button for it",
+      (await page.locator("button:has-text('Copy')").count()) > 0);
+
+    check("the limitation is stated plainly",
+      (await page.locator("text=cannot download the file itself").count()) > 0,
+      "the user should not be left wondering why no file arrived");
+    await ctx.close();
+  }
+
+  group("Translate controls are usable on arrival");
+  {
+    const { ctx, page } = await newPage({ sources: { direct: XML } });
+    await loadVideo(page);
+
+    const btn = page.locator("button:has-text('Translate')").first();
+    // The dropdown used to default to English on an English transcript, which
+    // the disable rule reads as "translate to its own language" — so the
+    // feature arrived permanently greyed out on most videos.
+    check("the Translate button is enabled without touching anything",
+      !(await btn.isDisabled()),
+      `dropdown="${await page.locator("#translate-target").inputValue()}" on an English track`);
+
+    check("the default target is not the transcript's own language",
+      (await page.locator("#translate-target").inputValue()) !== "English");
+
+    // Picking the transcript's own language should still be refused.
+    await page.selectOption("#translate-target", "English");
+    await page.waitForTimeout(200);
+    check("choosing the transcript's own language disables it again",
+      await btn.isDisabled(), "translating en -> en is a no-op and must stay blocked");
+    check("and says why", !!(await btn.getAttribute("title")),
+      "a greyed-out button with no explanation is the original bug");
+    await ctx.close();
+  }
+
+  group("Translate controls fit a phone screen");
+  {
+    const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+    const page = await ctx.newPage();
+    await page.route("**/*", (r) => {
+      const u = r.request().url();
+      if (u.startsWith(BASE) && !u.includes("/yt-timedtext")) return r.continue();
+      if (u.includes("timedtext")) return r.fulfill({ status: 200, contentType: "text/xml", body: XML });
+      if (u.includes("/oembed")) return r.fulfill({ status: 200, contentType: "application/json",
+        body: JSON.stringify({ title: "T", author_name: "A", author_url: "", thumbnail_url: "" }) });
+      return r.fulfill({ status: 204, body: "" });
+    });
+    await page.route(`${BASE}/api/transcript`, (r) =>
+      r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(META) }));
+    await page.goto(`${BASE}/studio`, { waitUntil: "domcontentloaded" });
+    await page.fill("input[placeholder='Paste YouTube link here...']", "dQw4w9WgXcQ");
+    await page.click("button:has-text('Load Video')");
+    await page.waitForSelector("button:has-text('Transcript')", { timeout: 25000 });
+    await page.click("button:has-text('Transcript')");
+    await page.waitForTimeout(900);
+
+    // Measured before the fix: the button sat 10px past a 390px viewport.
+    // Document scrollWidth stayed clean, so an overflow check alone missed it.
+    const box = await page.locator("button:has-text('Translate')").first().boundingBox();
+    check("the Translate button is fully on screen at 390px",
+      !!box && box.x + box.width <= 390,
+      box ? `right edge at ${Math.round(box.x + box.width)}px of 390px` : "button not found");
     await ctx.close();
   }
 

@@ -276,6 +276,93 @@ function cacheSet(videoId, value) {
  * result rather than null-for-everything, so the caller knows whether retrying
  * could possibly help.
  */
+/**
+ * Decide what a watch-page response actually means. Pure, so the whole
+ * decision table is testable without touching the network.
+ *
+ * Outcomes: ok | none | blocked | throttled | unavailable | transient
+ */
+export function classifyWatchPage(httpStatus, html) {
+  if (httpStatus === 429 || httpStatus === 403) {
+    return { kind: "throttled", detail: `YouTube returned HTTP ${httpStatus}` };
+  }
+  if (httpStatus === 404) return { kind: "unavailable", detail: "That video does not exist." };
+  if (httpStatus !== 200) {
+    return { kind: "transient", detail: `YouTube returned HTTP ${httpStatus}` };
+  }
+
+  const body = html || "";
+  if (body.length < MIN_REAL_PAGE_BYTES) {
+    return {
+      kind: "throttled",
+      detail: `YouTube served a ${body.length}-byte page instead of the video page`,
+    };
+  }
+
+  // Read playabilityStatus specifically rather than scanning the whole page —
+  // words like UNPLAYABLE appear elsewhere in a healthy page's 1.4MB of JSON.
+  const playability = body.match(
+    /"playabilityStatus":\{"status":"([A-Z_]+)"(?:,"reason":"((?:[^"\\]|\\.)*)")?/
+  );
+  const status = playability?.[1];
+  const reason = playability?.[2]
+    ? playability[2].replace(/\\u0026/g, "&").replace(/\\"/g, '"').replace(/\\n/g, " ")
+    : null;
+
+  if (status === "LOGIN_REQUIRED") {
+    // Measured against the live site: a public, perfectly available video
+    // returns LOGIN_REQUIRED with reason "Sign in to confirm you're not a bot"
+    // when the request comes from a datacenter IP. Reporting that as a private
+    // video sends the user chasing a problem they do not have.
+    if (!reason || /not a bot|sign in to confirm|unusual traffic/i.test(reason)) {
+      return { kind: "blocked", detail: reason || "YouTube bot check" };
+    }
+    return {
+      kind: "unavailable",
+      detail: `YouTube says: "${reason}" — the video is private or needs sign-in.`,
+    };
+  }
+
+  if (status === "AGE_VERIFICATION_REQUIRED" || status === "CONTENT_CHECK_REQUIRED") {
+    return {
+      kind: "unavailable",
+      detail: reason || "That video is age-restricted, so its captions cannot be read.",
+    };
+  }
+
+  if (status === "UNPLAYABLE" || status === "ERROR") {
+    // Pass YouTube's own wording through — "This video is unavailable",
+    // "This video is private" and "not available in your country" are
+    // different problems the user can act on differently.
+    return {
+      kind: "unavailable",
+      detail: reason ? `YouTube says: "${reason}"` : "That video is unavailable.",
+    };
+  }
+
+  const captionIdx = body.indexOf('"captionTracks":');
+  if (captionIdx < 0) {
+    // A full page whose player response is OK but carries no caption tracks
+    // really does mean the video has none.
+    return { kind: "none" };
+  }
+
+  const openBracket = body.indexOf("[", captionIdx);
+  const balanced = openBracket < 0 ? null : extractBalancedJson(body, openBracket);
+  if (!balanced) return { kind: "transient", detail: "caption data was malformed" };
+
+  let tracksJson;
+  try {
+    tracksJson = JSON.parse(balanced);
+  } catch {
+    return { kind: "transient", detail: "caption data did not parse" };
+  }
+
+  if (!Array.isArray(tracksJson) || tracksJson.length === 0) return { kind: "none" };
+
+  return { kind: "ok", tracks: mapCaptionTracks(tracksJson) };
+}
+
 async function fetchCaptionsFromWatchPage(videoId) {
   let res;
   try {
@@ -291,58 +378,8 @@ async function fetchCaptionsFromWatchPage(videoId) {
     return { kind: "transient", detail: `request failed: ${err.message}` };
   }
 
-  // Previously the status was never inspected, so a 429 was indistinguishable
-  // from a video with no captions.
-  if (res.status === 429 || res.status === 403) {
-    return { kind: "throttled", detail: `YouTube returned HTTP ${res.status}` };
-  }
-  if (res.status >= 500) {
-    return { kind: "transient", detail: `YouTube returned HTTP ${res.status}` };
-  }
-  if (res.status === 404) {
-    return { kind: "unavailable", detail: "That video does not exist." };
-  }
-  if (!res.ok) {
-    return { kind: "transient", detail: `YouTube returned HTTP ${res.status}` };
-  }
-
-  const html = await res.text();
-
-  if (html.length < MIN_REAL_PAGE_BYTES) {
-    return {
-      kind: "throttled",
-      detail: `YouTube served a ${html.length}-byte page instead of the video page`,
-    };
-  }
-
-  if (/"status":"(LOGIN_REQUIRED|UNPLAYABLE|ERROR)"/.test(html)) {
-    return {
-      kind: "unavailable",
-      detail: "That video is private, age-restricted, or unavailable.",
-    };
-  }
-
-  const captionIdx = html.indexOf('"captionTracks":');
-  if (captionIdx < 0) {
-    // A full page with a player response but no caption tracks really does
-    // mean the video has none.
-    return { kind: "none" };
-  }
-
-  const openBracket = html.indexOf("[", captionIdx);
-  const balanced = openBracket < 0 ? null : extractBalancedJson(html, openBracket);
-  if (!balanced) return { kind: "transient", detail: "caption data was malformed" };
-
-  let tracksJson;
-  try {
-    tracksJson = JSON.parse(balanced);
-  } catch {
-    return { kind: "transient", detail: "caption data did not parse" };
-  }
-
-  if (!Array.isArray(tracksJson) || tracksJson.length === 0) return { kind: "none" };
-
-  return { kind: "ok", tracks: mapCaptionTracks(tracksJson) };
+  const html = res.status === 200 ? await res.text() : "";
+  return classifyWatchPage(res.status, html);
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -385,6 +422,15 @@ export async function fetchAllTranscripts(videoId) {
 
   if (last.kind === "unavailable") {
     throw new TranscriptError("unavailable", last.detail, 422);
+  }
+
+  if (last.kind === "blocked") {
+    throw new TranscriptError(
+      "bot_check",
+      "YouTube is challenging this server with a bot check, so it will not hand over the caption list. This is not a problem with the video — it happens because the request comes from a datacenter IP. Try again shortly; if it keeps happening, this video's captions cannot be read from the server.",
+      429,
+      120
+    );
   }
 
   if (last.kind === "throttled") {

@@ -36,7 +36,7 @@ export default tseslint.config(
   {
     // Test scripts run in Node, but page.evaluate() callbacks are serialised
     // and run inside the browser, so both global sets are legitimate here.
-    files: ["tests/**/*.mjs"],
+    files: ["tests/**/*.mjs", "scripts/**/*.mjs"],
     extends: [js.configs.recommended],
     languageOptions: {
       ecmaVersion: "latest",

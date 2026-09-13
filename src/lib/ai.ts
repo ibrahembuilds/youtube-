@@ -41,6 +41,7 @@ export interface TranscriptResult {
  */
 export type TranscriptErrorCode =
   | "throttled"
+  | "bot_check"
   | "no_captions"
   | "unavailable"
   | "upstream_error"
@@ -165,70 +166,148 @@ export async function fetchAllTranscriptContent(
   );
 }
 
+const XML_ENTITIES: Record<string, string> = {
+  amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
+};
+
+/**
+ * Decode XML character references in a single pass.
+ *
+ * Chained .replace() calls corrupt each other: YouTube writes a literal "&"
+ * as "&amp;amp;", and replacing /&amp;/ first turns that into "&amp;", which
+ * no later rule can recover. One pass, repeated while the text still shrinks,
+ * handles both single and double escaping.
+ */
+function decodeEntities(text: string): string {
+  let out = text;
+  for (let pass = 0; pass < 3; pass++) {
+    const next = out.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (whole, body: string) => {
+      if (body[0] === "#") {
+        const code = body[1] === "x" || body[1] === "X"
+          ? parseInt(body.slice(2), 16)
+          : parseInt(body.slice(1), 10);
+        return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : whole;
+      }
+      const named = XML_ENTITIES[body.toLowerCase()];
+      return named === undefined ? whole : named;
+    });
+    if (next === out) break;
+    out = next;
+  }
+  return out;
+}
+
 /** Parse YouTube's XML transcript format into segments. */
 export function parseTranscriptXml(xml: string): TranscriptSegment[] {
   const segments: TranscriptSegment[] = [];
-  const regex = /<text start="([\d.]+)" dur="([\d.]+)"[^>]*>(.*?)<\/text>/g;
-  let match;
+  // Match any <text ...> element and read its attributes by name, so a change
+  // in attribute order or a missing dur does not silently drop the whole track.
+  const regex = /<text\b([^>]*)>([\s\S]*?)<\/text>/g;
+  let match: RegExpExecArray | null;
 
   while ((match = regex.exec(xml)) !== null) {
-    const text = match[3]
-      .replace(/&amp;/g, "&")
-      .replace(/&#39;/g, "'")
-      .replace(/&quot;/g, '"')
-      .replace(/&lt;/g, "<")
-      .replace(/&gt;/g, ">")
-      .replace(/&amp;amp;/g, "&")
-      .trim();
-    if (text) {
-      segments.push({
-        text,
-        start: parseFloat(match[1]),
-        duration: parseFloat(match[2]),
-      });
-    }
+    const attrs = match[1];
+    const start = parseFloat(/\bstart="([^"]*)"/.exec(attrs)?.[1] ?? "");
+    const duration = parseFloat(/\bdur="([^"]*)"/.exec(attrs)?.[1] ?? "");
+    if (!Number.isFinite(start)) continue;
+
+    // Caption text can carry inline markup; strip tags before decoding.
+    const text = decodeEntities(match[2].replace(/<[^>]*>/g, "")).replace(/\s+/g, " ").trim();
+    if (!text) continue;
+
+    segments.push({ text, start, duration: Number.isFinite(duration) ? duration : 0 });
   }
 
   return segments;
 }
 
-/** Parse YouTube's JSON3 transcript format (fmt=json3). */
+/**
+ * Parse YouTube's JSON3 transcript format (fmt=json3).
+ *
+ * Shape matters here: timing is on the EVENT (tStartMs, dDurationMs) and each
+ * segment carries only an offset from it (tOffsetMs). Reading seg.tStartMs —
+ * which does not exist — made every segment start at 0:00.
+ */
 export function parseTranscriptJson3(json: string): TranscriptSegment[] {
   const segments: TranscriptSegment[] = [];
   try {
     const data = JSON.parse(json);
-    const events = data.events || [];
+    const events = Array.isArray(data?.events) ? data.events : [];
+
     for (const event of events) {
-      const segs = event.segs || [];
-      for (const seg of segs) {
-        const text = (seg.utf8 || "").replace(/\n/g, " ").trim();
-        if (text) {
-          segments.push({
-            text,
-            start: (seg.tStartMs || 0) / 1000,
-            duration: ((seg.dDurationMs || seg.tStartMs || 0) - (seg.tStartMs || 0)) / 1000 || 2,
-          });
-        }
-      }
+      const eventStartMs = Number(event?.tStartMs) || 0;
+      const eventDurationMs = Number(event?.dDurationMs) || 0;
+      const segs = Array.isArray(event?.segs) ? event.segs : [];
+
+      // Join a single event's segments into one line. YouTube splits a caption
+      // into word-level pieces, and one segment per word is unusable both in
+      // the transcript pane and as AI context.
+      const text = decodeEntities(segs.map((seg: { utf8?: string }) => seg?.utf8 ?? "").join(""))
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!text) continue;
+
+      segments.push({
+        text,
+        start: eventStartMs / 1000,
+        duration: eventDurationMs / 1000,
+      });
     }
   } catch {
-    // Return whatever we parsed
+    // Malformed payload — return whatever parsed cleanly.
   }
   return segments;
 }
+
+/**
+ * Render a timestamp the way YouTube does: m:ss under an hour, h:mm:ss over.
+ * Without the hour case, 3725s printed as "62:05" — which the AI then quoted
+ * back, and which no viewer can find in the player.
+ */
+export function formatTimestamp(seconds: number): string {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return h > 0
+    ? `${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`
+    : `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+export const MAX_AI_CONTEXT_CHARS = 50000;
 
 /** Format segments into timestamped text for AI context. */
 export function formatTranscriptText(segments: TranscriptSegment[]): string {
   let result = "";
   for (const s of segments) {
-    const m = Math.floor(s.start / 60);
-    const sec = Math.floor(s.start % 60);
-    const ts = `${m}:${sec.toString().padStart(2, "0")}`;
-    const line = `[${ts}] ${s.text}\n`;
-    if (result.length + line.length > 50000) break;
+    const line = `[${formatTimestamp(s.start)}] ${s.text}\n`;
+    if (result.length + line.length > MAX_AI_CONTEXT_CHARS) break;
     result += line;
   }
   return result;
+}
+
+/** How much of a transcript actually fits in the AI context. */
+export function transcriptCoverage(segments: TranscriptSegment[]): {
+  includedSegments: number;
+  totalSegments: number;
+  truncated: boolean;
+  lastIncludedStart: number;
+} {
+  let used = 0;
+  let included = 0;
+  for (const s of segments) {
+    const line = `[${formatTimestamp(s.start)}] ${s.text}\n`;
+    if (used + line.length > MAX_AI_CONTEXT_CHARS) break;
+    used += line.length;
+    included++;
+  }
+  return {
+    includedSegments: included,
+    totalSegments: segments.length,
+    truncated: included < segments.length,
+    lastIncludedStart: included > 0 ? segments[included - 1].start : 0,
+  };
 }
 
 // ─── Translation ──────────────────────────────────────────────────────
@@ -326,7 +405,12 @@ export async function getDownloadInfo(videoId: string): Promise<DownloadInfo> {
 }
 
 export interface DownloadInfo {
-  title: string;
   videoId: string;
-  options: { label: string; desc: string; url: string; type: "video" | "audio" | "external" }[];
+  videoUrl: string;
+  options: {
+    label: string;
+    desc: string;
+    url: string;
+    type: "external-tool" | "external";
+  }[];
 }
