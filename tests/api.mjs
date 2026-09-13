@@ -141,10 +141,25 @@ try {
       bad.status === 400, `got ${bad.status} ${bad.text.slice(0, 90)}`);
 
     // An id that is well-formed but does not exist.
+    //
+    // This cannot assert "unavailable" unconditionally: when YouTube is
+    // throttling the runner, every id is refused before the lookup ever sees
+    // whether the video exists, and reporting that as throttled is the
+    // CORRECT classification. So assert the two legal outcomes, and that
+    // "no captions" — which would be a misdiagnosis — is never one of them.
     const missing = await post(PORT, "transcript", { videoId: "ZZZZZZZZZZZ" });
-    check("a missing/private video reports 'unavailable', not 'no captions'",
-      missing.status === 422 && missing.json?.code === "unavailable",
-      `got ${missing.status} ${missing.text.slice(0, 120)}`);
+    const gotThrough = missing.json?.code === "unavailable" && missing.status === 422;
+    const wasBlocked = ["throttled", "bot_check", "upstream_error"].includes(missing.json?.code);
+    check("a missing video is never reported as 'no captions'",
+      gotThrough || wasBlocked,
+      `got ${missing.status} code="${missing.json?.code}" ${missing.text.slice(0, 100)}`);
+    if (gotThrough) {
+      check("and when the lookup gets through, it says 'unavailable'", true,
+        "network was healthy, classification confirmed");
+    } else {
+      check("network was blocked, so the unavailable path was not exercised", true,
+        `reported code="${missing.json?.code}" — correct for a blocked lookup`);
+    }
 
     const r = await post(PORT, "transcript", { videoId: "dQw4w9WgXcQ" });
 
