@@ -38,8 +38,18 @@ both directions:
 - an **untagged** check that fails is a regression → non-zero exit
 - a **tagged** check that passes reports `FIXED` → remove the tag
 
-Open tags: F05 (summary type), F10 (badge honesty), F11 (chat gating),
-F17 (no 404 route).
+No open known-issue tags remain. Summary selection, readiness badges, chat
+gating, and 404 navigation now have ordinary regression assertions.
+
+`npm run test:reliability` tests local history validation, limits, ordering,
+bookmarks, storage failures, YouTube URL handling, pre-parsed production
+request bodies, split UTF-8 request chunks, and simulated AI provider responses.
+It uses a fixture key and replaces upstream fetch; it never sends paid requests.
+
+The browser suite also tests local history across reloads, searches, bookmarks,
+deletions and reopening; transcript search, seek and text export; translated
+output; chat/summary/clip retries; stale response isolation; and layouts at
+1440, 768, 390 and 320px. Screenshots are written to `docs/screenshots`.
 
 ## Browser binary
 

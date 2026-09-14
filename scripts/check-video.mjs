@@ -8,31 +8,18 @@
 // minute. This prints which stage failed and what to do about it, instead of
 // leaving you guessing from one error message in the UI.
 
+import { extractVideoId } from "../src/lib/youtube.ts";
+
 const args = process.argv.slice(2);
 const appIndex = args.indexOf("--app");
 const APP = appIndex >= 0 ? args[appIndex + 1] : process.env.APP_URL || "http://localhost:3000";
-const input = args.filter((a, i) => a !== "--app" && i !== appIndex + 1)[0];
+const input = args.filter((_a, i) => appIndex < 0 || (i !== appIndex && i !== appIndex + 1))[0];
 
 if (!input) {
   console.error("usage: node scripts/check-video.mjs <youtube-url-or-id> [--app <base-url>]");
   process.exit(2);
 }
 
-const ID_RE = /^[a-zA-Z0-9_-]{11}$/;
-function extractId(value) {
-  const patterns = [
-    /(?:youtube\.com\/watch\?v=)([a-zA-Z0-9_-]{11})/,
-    /(?:youtu\.be\/)([a-zA-Z0-9_-]{11})/,
-    /(?:youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/,
-    /(?:youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/,
-    /(?:youtube\.com\/live\/)([a-zA-Z0-9_-]{11})/,
-  ];
-  for (const p of patterns) {
-    const m = value.match(p);
-    if (m) return m[1];
-  }
-  return ID_RE.test(value.trim()) ? value.trim() : null;
-}
 
 const g = (t) => `\x1b[32m${t}\x1b[0m`;
 const r = (t) => `\x1b[31m${t}\x1b[0m`;
@@ -44,7 +31,7 @@ const line = (label, verdict, detail) =>
 console.log(`\nChecking ${input}\n  via ${APP}\n`);
 
 // ── 1. the URL itself ──
-const videoId = extractId(input);
+const videoId = extractVideoId(input);
 if (!videoId) {
   line("url", r("FAIL"), "not a recognised YouTube URL or 11-character id");
   process.exit(1);

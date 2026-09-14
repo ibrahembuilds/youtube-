@@ -7,6 +7,10 @@ export default async function handler(req, res) {
   const { messages, transcriptContext } = body;
 
   if (!messages || !Array.isArray(messages)) return res.status(400).json({ error: "messages array is required" });
+  if (messages.length > 20) return res.status(400).json({ error: "Too many messages (maximum 20)" });
+  if (messages.some((message) => !message || !["user", "assistant"].includes(message.role) || typeof message.content !== "string" || message.content.length > 4000)) {
+    return res.status(400).json({ error: "Each message must be a user or assistant message of 4,000 characters or fewer" });
+  }
   const contextError = validateTranscriptContext(transcriptContext);
   if (contextError) return res.status(400).json({ error: contextError });
 

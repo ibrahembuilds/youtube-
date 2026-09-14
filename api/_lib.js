@@ -102,8 +102,22 @@ export function checkRateLimit(req) {
 }
 
 export function parseBody(req, maxBytes = MAX_BODY_BYTES) {
+  // Hosted runtimes can supply a parsed body after consuming the stream.
+  // Listening for "end" a second time would leave every request hanging.
+  if (req.body !== undefined) {
+    try {
+      const raw = Buffer.isBuffer(req.body) ? req.body.toString("utf8")
+        : typeof req.body === "string" ? req.body : JSON.stringify(req.body);
+      if (Buffer.byteLength(raw) > maxBytes) {
+        return Promise.reject(Object.assign(new Error("Request body too large"), { statusCode: 413 }));
+      }
+      return Promise.resolve(JSON.parse(raw));
+    } catch {
+      return Promise.reject(Object.assign(new Error("Invalid JSON body"), { statusCode: 400 }));
+    }
+  }
   return new Promise((resolve, reject) => {
-    let data = "";
+    const chunks = [];
     let bytes = 0;
     let settled = false;
 
@@ -126,13 +140,14 @@ export function parseBody(req, maxBytes = MAX_BODY_BYTES) {
         fail(413, "Request body too large");
         return;
       }
-      data += chunk;
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     });
     req.on("error", () => fail(400, "Could not read the request body"));
     req.on("end", () => {
       if (settled) return;
       settled = true;
       try {
+        const data = Buffer.concat(chunks).toString("utf8");
         resolve(data ? JSON.parse(data) : {});
       } catch {
         resolve({});
@@ -170,7 +185,12 @@ export async function guard(req, res) {
   }
 
   try {
-    return await parseBody(req);
+    const body = await parseBody(req);
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      res.status(400).json({ error: "Request body must be a JSON object" });
+      return null;
+    }
+    return body;
   } catch (err) {
     res.status(err.statusCode || 400).json({ error: err.message || "Invalid request body" });
     return null;
@@ -557,6 +577,7 @@ export async function callAI(messages, options = {}) {
       "X-Title": "YT Studio",
     },
     body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(json || model === MODELS.translate ? 50000 : 25000),
   });
 
   if (!res.ok) throw new Error(`AI request failed: ${await res.text()}`);
@@ -566,8 +587,11 @@ export async function callAI(messages, options = {}) {
   // moderation block, an upstream provider failure, or exhausted credit.
   // Reading data.choices[0] blindly turns that into a raw TypeError.
   const content = data?.choices?.[0]?.message?.content;
-  if (typeof content !== "string") {
+  if (typeof content !== "string" || !content.trim()) {
     throw new Error(data?.error?.message || "The AI provider returned no completion.");
+  }
+  if (data.choices[0].finish_reason === "length") {
+    throw new Error("The AI response was cut short. Try a shorter transcript or a briefer request.");
   }
   return content;
 }

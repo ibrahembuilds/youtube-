@@ -46,12 +46,10 @@ export function extractJsonObject(raw) {
   return null;
 }
 
-// Short-form platforms cap out around a minute, and nothing under ~10 seconds
-// is a publishable clip. Measured against the live endpoint, the model returned
-// 4-second clips on a long transcript and a 112-second one on a short
-// transcript when the prompt said nothing about duration.
-export const MIN_CLIP_SECONDS = 10;
-export const MAX_CLIP_SECONDS = 90;
+// This product targets 20–60 second clip ideas; these are editorial bounds,
+// not claims about every platform's maximum video duration.
+export const MIN_CLIP_SECONDS = 20;
+export const MAX_CLIP_SECONDS = 60;
 
 /** Keep only entries that have the fields the UI actually renders. */
 export function normaliseShorts(parsed) {
@@ -72,7 +70,7 @@ export function normaliseShorts(parsed) {
     }))
     .filter((s) => {
       const span = s.endTime - s.startTime;
-      return span >= MIN_CLIP_SECONDS && span <= MAX_CLIP_SECONDS;
+      return s.startTime >= 0 && span >= MIN_CLIP_SECONDS && span <= MAX_CLIP_SECONDS;
     });
 }
 
