@@ -62,6 +62,7 @@ export async function fetchTranscriptMeta(videoId: string): Promise<TranscriptRe
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ videoId }),
+    signal: AbortSignal.timeout(60000),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -320,6 +321,7 @@ export async function translateTranscript(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ segments, targetLanguage }),
+    signal: AbortSignal.timeout(65000),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: "Translation failed" }));
@@ -339,7 +341,8 @@ export async function chatWithVideo(
   const res = await fetch(`${API_BASE}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ videoId, messages, transcriptContext }),
+    body: JSON.stringify({ videoId, messages: messages.slice(-20).map((message) => ({ ...message, content: message.content.slice(0, 4000) })), transcriptContext }),
+    signal: AbortSignal.timeout(35000),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: "Chat failed" }));
@@ -359,6 +362,7 @@ export async function generateSummary(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ videoId, transcriptContext, type }),
+    signal: AbortSignal.timeout(35000),
   });
   if (!res.ok) throw new Error((await res.json().catch(() => ({ error: "Summary failed" }))).error);
   return (await res.json()).response;
@@ -374,6 +378,7 @@ export async function generateViralShorts(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ videoId, transcriptContext }),
+    signal: AbortSignal.timeout(65000),
   });
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "Failed");
   return (await res.json()).shorts;

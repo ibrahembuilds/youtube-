@@ -1,19 +1,29 @@
 // YouTube utilities
 
 export function extractVideoId(url: string): string | null {
-  const patterns = [
-    /(?:youtube\.com\/watch\?v=)([a-zA-Z0-9_-]{11})/,
-    /(?:youtu\.be\/)([a-zA-Z0-9_-]{11})/,
-    /(?:youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/,
-    /(?:youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/,
-    /(?:youtube\.com\/live\/)([a-zA-Z0-9_-]{11})/,
-  ];
-  for (const p of patterns) {
-    const match = url.match(p);
-    if (match) return match[1];
+  const value = url.trim();
+  // URL parsing handles mobile/music hosts, URL-encoded query strings and
+  // links where `v` is not the first query parameter. Restrict hosts so a
+  // lookalike domain cannot be accepted accidentally.
+  try {
+    const parsed = new URL(/^https?:\/\//i.test(value) ? value : `https://${value}`);
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
+    const allowedHost = host === "youtube.com" || host.endsWith(".youtube.com") || host === "youtu.be";
+    if (allowedHost) {
+      let candidate = "";
+      if (host === "youtu.be") candidate = parsed.pathname.split("/").filter(Boolean)[0] || "";
+      else if (parsed.pathname === "/watch") candidate = parsed.searchParams.get("v") || "";
+      else {
+        const parts = parsed.pathname.split("/").filter(Boolean);
+        if (["embed", "shorts", "live", "v"].includes(parts[0] || "")) candidate = parts[1] || "";
+      }
+      if (/^[a-zA-Z0-9_-]{11}$/.test(candidate)) return candidate;
+    }
+  } catch {
+    // Fall through to the raw-ID check below.
   }
   // Raw 11-char ID
-  if (/^[a-zA-Z0-9_-]{11}$/.test(url.trim())) return url.trim();
+  if (/^[a-zA-Z0-9_-]{11}$/.test(value)) return value;
   return null;
 }
 
@@ -28,7 +38,7 @@ export function getThumbnail(videoId: string, quality: "max" | "hq" | "mq" | "sd
 
 export async function fetchVideoInfo(videoId: string): Promise<VideoInfo> {
   // Use YouTube oEmbed API (no key needed)
-  const res = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`);
+  const res = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`, { signal: AbortSignal.timeout(10000) });
   if (!res.ok) throw new Error("Could not fetch video info");
   const data = await res.json();
   return {

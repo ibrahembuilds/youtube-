@@ -8,7 +8,10 @@ Paste a YouTube link. Watch, chat, summarize, and create viral shorts from any v
 - 💬 **Chat** with the video — ask any question, get AI answers with timestamps
 - 📝 **Summarize** — brief, detailed, bullet points, or key takeaways
 - ✂️ **Viral Shorts** — AI finds the best clips, writes scripts, captions, hashtags & thumbnail ideas
-- 📥 **Download** video or audio-only
+- 🕘 **History & Saved** — search and reopen your last 100 videos, with local bookmarks
+- 📥 **Export text** — transcripts, translations, summaries and clip scripts; external tools handle video/audio downloads
+
+History and bookmarks use this browser's localStorage, with no account or cross-device sync. Clearing browser data removes them. Generated AI results and video files are not saved. See [product comparison and UI decisions](docs/product-comparison.md).
 
 ## Tech Stack
 
@@ -50,6 +53,7 @@ if you need a hard cap.
 ```bash
 npm test            # units + api + e2e + languages
 npm run test:unit   # caption parsers, imported from src/
+npm run test:reliability # history/storage, production bodies and mocked AI contracts
 npm run test:api    # /api contract, CORS, rate limits — spawns its own server
 npm run test:e2e    # real Chromium against a production build
 npm run test:lang   # transcript rendering in 8 scripts, including right-to-left

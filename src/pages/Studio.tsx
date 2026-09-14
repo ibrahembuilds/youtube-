@@ -1,7 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useRef } from "react";
 import { Link } from "react-router-dom";
-import { Play, Sparkles, MessageCircle, Download, Scissors, Loader2, Send, FileText, List, CheckCircle, Clock, Globe, Languages } from "lucide-react";
-import { extractVideoId, getEmbedUrl, getThumbnail, fetchVideoInfo, type VideoInfo } from "@/lib/youtube";
+import { Play, Sparkles, MessageCircle, Download, Scissors, Loader2, Send, FileText, List, CheckCircle, Clock, Globe, Languages, Plus, Bookmark, ArrowUpRight, LayoutGrid, HardDrive, Link2 } from "lucide-react";
+import HistoryPanel from "@/components/HistoryPanel";
+import ExportText from "@/components/ExportText";
+import { HISTORY_KEY, readHistory, rememberVideo, writeHistory, type HistoryVideo } from "@/lib/history";
+import { extractVideoId, getEmbedUrl, fetchVideoInfo, type VideoInfo } from "@/lib/youtube";
 import {
   fetchTranscriptMeta, fetchAllTranscriptContent, fetchTranscriptContent,
   translateTranscript, chatWithVideo, generateSummary, generateViralShorts,
@@ -57,8 +60,28 @@ function defaultTargetLanguage(trackCode: string | undefined): string {
 const EMPTY_SEGMENTS: TranscriptSegment[] = [];
 
 export default function Studio() {
+  const [view, setView] = useState<"studio" | "history" | "saved">("studio");
+  const [history, setHistory] = useState<HistoryVideo[]>([]);
+  const [storageError, setStorageError] = useState("");
+  const historyRef = useRef<HistoryVideo[]>([]);
+  useEffect(() => {
+    const sync = () => { try { const items = readHistory(localStorage); historyRef.current = items; setHistory(items); } catch { setStorageError("Local history is unavailable or damaged. Videos still work; clear history to start fresh."); } };
+    sync();
+    const onStorage = (event: StorageEvent) => { if (event.key === HISTORY_KEY || event.key === null) sync(); };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
+  function updateHistory(items: HistoryVideo[]) {
+    historyRef.current = items;
+    setHistory(items);
+    try { writeHistory(localStorage, items); setStorageError(""); } catch { setStorageError("This browser could not save your history. Check available storage and browser privacy settings."); }
+  }
+  const contextVersion = useRef(0);
+  const translationVersion = useRef(0);
+  useEffect(() => () => { contextVersion.current++; }, []);
   const [url, setUrl] = useState("");
   const [videoId, setVideoId] = useState<string | null>(null);
+  const [playStart, setPlayStart] = useState(0);
   const [videoInfo, setVideoInfo] = useState<VideoInfo | null>(null);
   const [transcriptMeta, setTranscriptMeta] = useState<TranscriptResult | null>(null);
   const [trackSegments, setTrackSegments] = useState<Map<number, TranscriptSegment[]>>(new Map());
@@ -126,14 +149,38 @@ export default function Studio() {
     return !!targetCode && targetCode === baseCode(trackCode);
   }, [targetLanguage, trackCode]);
 
-  async function handleLoad() {
+  function newVideo() {
+    contextVersion.current++;
+    translationVersion.current++;
+    setView("studio"); setUrl(""); setVideoId(null); setVideoInfo(null);
+    setTranscriptMeta(null); setTrackSegments(new Map()); setSelectedTrackIndex(0);
+    setLoading(false); setLoadingTranscript(false); setError("");
+    setChatLoading(false); setSummaryLoading(false); setViralLoading(false);
+    setTranslating(false); setDownloadLoading(false); setChatMessages([]);
+    setSummary(""); setShorts([]); setTranslatedText(""); setDownloadInfo(null);
+    requestAnimationFrame(() => document.getElementById("video-url")?.focus());
+  }
+
+  async function handleLoad(sourceUrl = url) {
+    if (loading) return;
     setError("");
     setErrorIsRetryable(false);
-    const id = extractVideoId(url);
+    const id = extractVideoId(sourceUrl);
     if (!id) { setError("Please enter a valid YouTube URL"); return; }
+    const version = ++contextVersion.current;
+    setView("studio");
+    setUrl(sourceUrl);
+    updateHistory(rememberVideo(historyRef.current, { videoId: id, title: historyRef.current.find((item) => item.videoId === id)?.title || `YouTube video · ${id}`, author: historyRef.current.find((item) => item.videoId === id)?.author || "" }));
+    setChatLoading(false);
+    setSummaryLoading(false);
+    setViralLoading(false);
+    setTranslating(false);
+    setDownloadLoading(false);
+    setChatInput("");
 
     setLoading(true);
     setVideoId(id);
+    setPlayStart(0);
     setVideoInfo(null);
     setTranscriptMeta(null);
     setTrackSegments(new Map());
@@ -151,8 +198,15 @@ export default function Studio() {
       fetchVideoInfo(id),
       fetchTranscriptMeta(id),
     ]);
+    if (version !== contextVersion.current) return;
 
-    if (infoResult.status === "fulfilled") setVideoInfo(infoResult.value);
+    if (infoResult.status === "fulfilled") {
+      setVideoInfo(infoResult.value);
+      // Do not recreate an entry deleted while metadata was loading.
+      if (historyRef.current.some((item) => item.videoId === id)) {
+        updateHistory(historyRef.current.map((item) => item.videoId === id ? { ...item, title: infoResult.value.title, author: infoResult.value.author } : item));
+      }
+    }
 
     if (metaResult.status === "rejected") {
       const err: any = metaResult.reason;
@@ -175,52 +229,80 @@ export default function Studio() {
       // Fetch actual transcript content from BROWSER (not server)
       setLoadingTranscript(true);
       const allSegments = await fetchAllTranscriptContent(meta.tracks);
+      if (version !== contextVersion.current) return;
       const newMap = new Map<number, TranscriptSegment[]>();
       allSegments.forEach((segs, i) => {
         if (segs) newMap.set(i, segs);
       });
       setTrackSegments(newMap);
+      if (!newMap.has(0) && newMap.size) setSelectedTrackIndex(newMap.keys().next().value!);
     } finally {
-      setLoading(false);
-      setLoadingTranscript(false);
+      if (version === contextVersion.current) {
+        setLoading(false);
+        setLoadingTranscript(false);
+      }
     }
   }
 
   async function handleSwitchTrack(index: number) {
+    if (loading || index === selectedTrackIndex) return;
+    const version = ++contextVersion.current;
+    setChatLoading(false);
+    setSummaryLoading(false);
+    setViralLoading(false);
+    setTranslating(false);
+    setDownloadLoading(false);
+    setError("");
     setSelectedTrackIndex(index);
     setTranslatedText("");
+    // AI output is grounded in the selected transcript. Clear it when the
+    // language changes instead of showing an answer generated from another
+    // track while the new one is loading.
+    setChatMessages([]);
+    setSummary("");
+    setShorts([]);
 
     // If we haven't loaded this track's segments yet, fetch them now (browser-side)
     if (!trackSegments.has(index) && transcriptMeta?.tracks[index]) {
+      setLoadingTranscript(true);
       try {
         const segs = await fetchTranscriptContent(transcriptMeta.tracks[index]);
+        if (version !== contextVersion.current) return;
         setTrackSegments((prev) => {
           const next = new Map(prev);
           next.set(index, segs);
           return next;
         });
       } catch {
-        // silently fail — segments just stay empty for this track
+        if (version === contextVersion.current) setError("Could not load this caption track. Choose another language or reload the video.");
+      } finally {
+        if (version === contextVersion.current) setLoadingTranscript(false);
       }
     }
   }
 
   async function handleTranslate() {
     if (!selectedSegments.length || translating) return;
+    const version = contextVersion.current;
+    const translation = ++translationVersion.current;
+    setError("");
     setTranslating(true);
     setTranslatedText("");
     try {
       const result = await translateTranscript(selectedSegments, targetLanguage);
+      if (version !== contextVersion.current || translation !== translationVersion.current) return;
       setTranslatedText(result);
     } catch (err: any) {
-      setError(err.message || "Translation failed");
+      if (version === contextVersion.current && translation === translationVersion.current) setError(err.message || "Translation failed");
     } finally {
-      setTranslating(false);
+      if (version === contextVersion.current && translation === translationVersion.current) setTranslating(false);
     }
   }
 
   async function handleChat() {
     if (!chatInput.trim() || chatLoading || !transcriptText) return;
+    const version = contextVersion.current;
+    setError("");
     const userMsg: ChatMessage = { role: "user", content: chatInput };
     const newMessages = [...chatMessages, userMsg];
     setChatMessages(newMessages);
@@ -228,52 +310,68 @@ export default function Studio() {
     setChatLoading(true);
     try {
       const response = await chatWithVideo(videoId!, newMessages, transcriptText);
+      if (version !== contextVersion.current) return;
       setChatMessages([...newMessages, { role: "assistant", content: response }]);
     } catch (err: any) {
-      setChatMessages([...newMessages, { role: "assistant", content: `Error: ${err.message}` }]);
+      if (version === contextVersion.current) {
+        setChatMessages(chatMessages);
+        setChatInput(userMsg.content);
+        setError(err.message || "Chat failed. Try again.");
+      }
     } finally {
-      setChatLoading(false);
+      if (version === contextVersion.current) setChatLoading(false);
     }
   }
 
-  async function handleSummary() {
+  async function handleSummary(typeOverride = summaryType) {
     if (summaryLoading || !transcriptText) return;
+    const version = contextVersion.current;
+    setError("");
     setSummaryLoading(true);
     setSummary("");
     try {
-      const result = await generateSummary(videoId!, transcriptText, summaryType);
+      const result = await generateSummary(videoId!, transcriptText, typeOverride);
+      if (version !== contextVersion.current) return;
       setSummary(result);
     } catch (err: any) {
-      setSummary(`Error: ${err.message}`);
+      if (version !== contextVersion.current) return;
+      setSummary("");
+      setError(err.message || "Summary generation failed");
     } finally {
-      setSummaryLoading(false);
+      if (version === contextVersion.current) setSummaryLoading(false);
     }
   }
 
   async function handleViral() {
     if (viralLoading || !transcriptText) return;
+    const version = contextVersion.current;
+    setError("");
     setViralLoading(true);
     setShorts([]);
     try {
       const result = await generateViralShorts(videoId!, transcriptText);
+      if (version !== contextVersion.current) return;
       setShorts(result);
     } catch (err: any) {
-      setError(err.message);
+      if (version === contextVersion.current) setError(err.message);
     } finally {
-      setViralLoading(false);
+      if (version === contextVersion.current) setViralLoading(false);
     }
   }
 
   async function handleDownload() {
     if (downloadLoading) return;
+    const version = contextVersion.current;
+    setError("");
     setDownloadLoading(true);
     try {
       const info = await getDownloadInfo(videoId!);
+      if (version !== contextVersion.current) return;
       setDownloadInfo(info);
     } catch (err: any) {
-      setError(err.message);
+      if (version === contextVersion.current) setError(err.message);
     } finally {
-      setDownloadLoading(false);
+      if (version === contextVersion.current) setDownloadLoading(false);
     }
   }
 
@@ -287,20 +385,28 @@ export default function Studio() {
   ];
 
   return (
-    <div className="min-h-screen bg-white">
-      <header className="border-b border-ink-100 sticky top-0 z-10 bg-white/80 backdrop-blur-sm">
+    <div className="studio-shell">
+      <aside className="studio-sidebar">
+        <Link to="/" className="studio-brand"><span><Play size={19} fill="currentColor" /></span>YT Studio<span className="brand-dot">.</span></Link>
+        <button className="new-video-button" onClick={newVideo}><Plus size={18} /> New video</button>
+        <p className="sidebar-label">WORKSPACE</p>
+        <nav aria-label="Workspace navigation">
+          <button className={view === "studio" ? "active" : ""} onClick={() => setView("studio")}><LayoutGrid size={18} /> Studio</button>
+          <button className={view === "history" ? "active" : ""} onClick={() => setView("history")}><Clock size={18} /> History <span>{history.length}</span></button>
+          <button className={view === "saved" ? "active" : ""} onClick={() => setView("saved")}><Bookmark size={18} /> Saved <span>{history.filter((item) => item.saved).length}</span></button>
+        </nav>
+        <div className="sidebar-recents"><p className="sidebar-label">RECENT VIDEOS</p>{history.slice(0, 5).map((item) => <button key={item.videoId} disabled={loading} onClick={() => handleLoad(item.videoId)} title={item.title}><Play size={13} /><span>{item.title}</span></button>)}{!history.length && <p>Your recently opened videos will appear here.</p>}</div>
+        <div className="sidebar-bottom"><HardDrive size={17} /><div><strong>Your space. Your browser.</strong><p>History is saved locally.</p></div></div>
+      </aside>
+      <div className="studio-main">
+      <header className="studio-topbar">
         <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
-          <Link to="/" className="flex items-center gap-2">
-            <div className="w-8 h-8 rounded-lg bg-ink-900 flex items-center justify-center">
-              <Play className="w-4 h-4 text-white fill-white" />
-            </div>
-            <span className="font-semibold">YT Studio</span>
-          </Link>
+          <span className="text-sm text-ink-600">Workspace <span className="mx-2 text-ink-300">/</span> <strong className="text-ink-900">{view === "studio" ? "Studio" : view === "history" ? "History" : "Saved"}</strong></span>
           <div className="flex items-center gap-3">
             {transcriptMeta && (
               <div className="badge bg-green-50 text-green-600">
                 <CheckCircle className="w-3 h-3" />
-                {transcriptMeta.totalTracks} language{transcriptMeta.totalTracks !== 1 ? "s" : ""}
+                {trackSegments.size} transcript{trackSegments.size !== 1 ? "s" : ""} ready
                 {loadingTranscript && <Loader2 className="w-3 h-3 animate-spin ml-1" />}
               </div>
             )}
@@ -308,12 +414,19 @@ export default function Studio() {
         </div>
       </header>
 
-      <div className="max-w-6xl mx-auto px-6 py-8">
+      <div className="studio-content">
+        {storageError && <div className="confirmation" role="alert">{storageError}<button className="btn-secondary" onClick={() => updateHistory([])}>Clear history</button></div>}
+        {view !== "studio" && <HistoryPanel key={view} savedOnly={view === "saved"} videos={history} onChange={updateHistory} onOpen={(id) => { if (!loading) handleLoad(id); }} />}
+        <div hidden={view !== "studio"}>
+        <div className="section-heading"><div><p className="eyebrow">LESS WATCHING. MORE UNDERSTANDING.</p><h1>{videoId ? "Video workspace" : "What will you discover today?"}</h1><p>Turn a YouTube video into notes, answers, and your next idea.</p></div><span className="workspace-label"><Sparkles size={14} /> AI workspace</span></div>
         {/* URL Input */}
-        <div className="mb-8">
-          <div className="flex gap-3">
+        <div className="video-input-card">
+          <label htmlFor="video-url" className="video-input-label"><Link2 size={16} /> Start with a YouTube link</label>
+          <div className="flex flex-col sm:flex-row gap-3">
             <input
+              id="video-url"
               type="text"
+              aria-label="YouTube video URL"
               value={url}
               onChange={(e) => setUrl(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleLoad()}
@@ -321,16 +434,16 @@ export default function Studio() {
               className="input flex-1"
               disabled={loading}
             />
-            <button onClick={handleLoad} className="btn-primary whitespace-nowrap" disabled={loading || !url}>
+            <button onClick={() => handleLoad()} className="btn-primary whitespace-nowrap sm:min-w-[120px]" disabled={loading || !url}>
               {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : "Load Video"}
             </button>
           </div>
           {error && (
-            <div className="mt-3 flex items-start gap-3">
+            <div role="alert" className="mt-3 flex items-start gap-3">
               <p className="text-sm text-red-500">{error}</p>
               {errorIsRetryable && (
                 <button
-                  onClick={handleLoad}
+                  onClick={() => handleLoad()}
                   disabled={loading}
                   className="btn-ghost text-xs border border-ink-200 shrink-0"
                 >
@@ -349,6 +462,7 @@ export default function Studio() {
             {transcriptMeta.tracks.map((track, i) => (
               <button
                 key={i}
+                disabled={loading}
                 onClick={() => handleSwitchTrack(i)}
                 className={`px-3 py-1 rounded-full text-xs font-medium transition-colors ${
                   i === selectedTrackIndex
@@ -365,6 +479,12 @@ export default function Studio() {
 
         {videoId && (
           <div className="animate-fade-in">
+            <div className="video-workspace-grid">
+            <div className="video-column"><WatchTab videoId={videoId} videoInfo={videoInfo} selectedTrack={selectedTrack} segmentCount={selectedSegments.length} start={playStart} />
+              <a className="source-link" href={`https://www.youtube.com/watch?v=${videoId}`} target="_blank" rel="noreferrer">Open original video <ArrowUpRight size={15} /></a>
+              <button className="btn-secondary w-full mt-3" onClick={() => updateHistory(historyRef.current.map((item) => item.videoId === videoId ? { ...item, saved: !item.saved } : item))}><Bookmark size={16} />{history.find((item) => item.videoId === videoId)?.saved ? "Saved to your videos" : "Save video"}</button>
+            </div>
+            <div className="tool-column">
             {videoInfo && (
               <div className="mb-4">
                 <h2 className="text-xl font-semibold">{videoInfo.title}</h2>
@@ -380,7 +500,7 @@ export default function Studio() {
               </div>
             )}
 
-            <div className="flex gap-1 mb-6 border-b border-ink-100 overflow-x-auto">
+            <div className="tool-tabs flex gap-1 mb-6 border-b border-ink-100 overflow-x-auto">
               {tabs.map((tab) => (
                 <button
                   key={tab.id}
@@ -403,7 +523,7 @@ export default function Studio() {
             </div>
 
             <div className="min-h-[400px]">
-              {activeTab === "watch" && <WatchTab videoId={videoId} videoInfo={videoInfo} selectedTrack={selectedTrack} segmentCount={selectedSegments.length} />}
+              {activeTab === "watch" && <div className="tool-overview"><div className="overview-icon"><Sparkles size={28} /></div><h2>Your video, unpacked.</h2><p>Read along, get the main points, or ask a question. Choose a tool above to get started.</p><div className="overview-features">{[{ id: "transcript" as const, label: "Read the transcript", icon: FileText }, { id: "chat" as const, label: "Ask a question", icon: MessageCircle }, { id: "summary" as const, label: "Get the key points", icon: List }].map((tool) => <button key={tool.id} onClick={() => setActiveTab(tool.id)}><tool.icon size={17} /><span>{tool.label}</span><ArrowUpRight size={16} /></button>)}</div></div>}
               {coverage.truncated && activeTab !== "watch" && activeTab !== "download" && (
                 <div className="mb-4 badge bg-amber-50 text-amber-700">
                   <Clock className="w-3 h-3" />
@@ -413,12 +533,14 @@ export default function Studio() {
               )}
               {activeTab === "transcript" && (
                 <TranscriptTab
+                  key={`${videoId}-${selectedTrackIndex}`}
+                  onSeek={setPlayStart}
                   segments={selectedSegments}
                   track={selectedTrack}
                   loading={loadingTranscript}
                   translatedText={translatedText}
                   targetLanguage={targetLanguage}
-                  setTargetLanguage={setTargetLanguage}
+                  setTargetLanguage={(language) => { translationVersion.current++; setTargetLanguage(language); setTranslatedText(""); setTranslating(false); }}
                   onTranslate={handleTranslate}
                   translating={translating}
                   targetIsSameLanguage={targetIsSameLanguage}
@@ -426,50 +548,51 @@ export default function Studio() {
                 />
               )}
               {activeTab === "chat" && (
-                <ChatTab messages={chatMessages} input={chatInput} setInput={setChatInput} onSend={handleChat} loading={chatLoading} hasTranscript={!!selectedTrack} />
+                <ChatTab messages={chatMessages} input={chatInput} setInput={setChatInput} onSend={handleChat} loading={chatLoading} hasTranscript={selectedSegments.length > 0} />
               )}
               {activeTab === "summary" && (
-                <SummaryTab summary={summary} loading={summaryLoading} type={summaryType} setType={setSummaryType} onRegenerate={handleSummary} />
+                <SummaryTab summary={summary} loading={summaryLoading} type={summaryType} setType={setSummaryType} onRegenerate={handleSummary} hasTranscript={selectedSegments.length > 0} />
               )}
               {activeTab === "viral" && (
-                <ViralTab shorts={shorts} loading={viralLoading} onRegenerate={handleViral} />
+                <ViralTab shorts={shorts} loading={viralLoading} onRegenerate={handleViral} hasTranscript={selectedSegments.length > 0} />
               )}
               {activeTab === "download" && (
-                <DownloadTab info={downloadInfo} loading={downloadLoading} />
+                <DownloadTab info={downloadInfo} loading={downloadLoading} onRetry={handleDownload} />
               )}
             </div>
+            </div></div>
           </div>
         )}
 
         {!videoId && !loading && (
-          <div className="text-center py-20">
-            <div className="w-16 h-16 rounded-2xl bg-ink-100 flex items-center justify-center mx-auto mb-4">
-              <Play className="w-7 h-7 text-ink-400" />
-            </div>
-            <p className="text-ink-400">Paste a YouTube link above to get started</p>
+          <div className="studio-empty">
+            <div className="empty-visual"><div className="visual-video"><Play size={30} fill="currentColor" /><span /><span /><span /></div><div className="visual-note"><Sparkles size={16} /><i /><i /><i /></div></div>
+            <h2>A little less scrolling.<br />A lot more clarity.</h2>
+            <p>Bring a lecture, interview, or deep dive.<br />Leave with something you can use.</p>
+            <div className="empty-tool-grid">{[{ icon: FileText, title: "Read & translate", desc: "Follow every word in your language." }, { icon: MessageCircle, title: "Ask & understand", desc: "Answers grounded in the transcript." }, { icon: Scissors, title: "Find your next clip", desc: "Hooks, scripts, and moments worth sharing." }].map((tool) => <div key={tool.title}><tool.icon size={21} /><h3>{tool.title}</h3><p>{tool.desc}</p></div>)}</div>
           </div>
         )}
       </div>
+      </div></div>
     </div>
   );
 }
 
 // ─── Tab Components ──────────────────────────────────────────────────
 
-function WatchTab({ videoId, videoInfo, selectedTrack, segmentCount }: {
-  videoId: string; videoInfo: VideoInfo | null; selectedTrack: TranscriptTrack | null; segmentCount: number;
+function WatchTab({ videoId, videoInfo, selectedTrack, segmentCount, start }: {
+  videoId: string; videoInfo: VideoInfo | null; selectedTrack: TranscriptTrack | null; segmentCount: number; start: number;
 }) {
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-      <div className="lg:col-span-2">
+    <div className="watch-details">
+      <div>
         <div className="aspect-video rounded-2xl overflow-hidden bg-ink-900">
-          <iframe src={getEmbedUrl(videoId)} className="w-full h-full" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowFullScreen />
+          <iframe title={videoInfo?.title || "YouTube video player"} src={`${getEmbedUrl(videoId)}&start=${Math.floor(start)}`} className="w-full h-full" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowFullScreen />
         </div>
       </div>
       <div>
         {videoInfo && (
           <div className="card p-4 mb-4">
-            <img src={getThumbnail(videoId, "mq")} alt={videoInfo.title} className="w-full rounded-lg mb-3" />
             <h3 className="font-semibold text-sm">{videoInfo.title}</h3>
             <p className="text-xs text-ink-500 mt-1">{videoInfo.author}</p>
           </div>
@@ -480,7 +603,7 @@ function WatchTab({ videoId, videoInfo, selectedTrack, segmentCount }: {
             <div className="space-y-2 text-sm text-ink-500">
               <div className="flex justify-between"><span>Language</span><span className="font-medium text-ink-700">{selectedTrack.languageName}</span></div>
               <div className="flex justify-between"><span>Type</span><span className="font-medium text-ink-700">{selectedTrack.kind === "asr" ? "Auto-generated" : "Manual"}</span></div>
-              <div className="flex justify-between"><span>Segments</span><span className="font-medium text-ink-700">{segmentCount || "Loading..."}</span></div>
+              <div className="flex justify-between"><span>Segments loaded</span><span className="font-medium text-ink-700">{segmentCount}</span></div>
             </div>
           </div>
         )}
@@ -492,12 +615,16 @@ function WatchTab({ videoId, videoInfo, selectedTrack, segmentCount }: {
 function TranscriptTab({
   segments, track, loading, translatedText, targetLanguage, setTargetLanguage, onTranslate, translating,
   onClearTranslation, targetIsSameLanguage,
+  onSeek,
 }: {
   segments: TranscriptSegment[]; track: TranscriptTrack | null; loading: boolean;
   translatedText: string; targetLanguage: string; setTargetLanguage: (v: string) => void;
   onTranslate: () => void; translating: boolean; onClearTranslation: () => void;
   targetIsSameLanguage: boolean;
+  onSeek: (seconds: number) => void;
 }) {
+  const [search, setSearch] = useState("");
+  const visibleSegments = segments.filter((segment) => segment.text.toLowerCase().includes(search.toLowerCase()));
   if (loading) {
     return (
       <div className="flex items-center gap-3 text-ink-400 py-20 justify-center">
@@ -542,6 +669,7 @@ function TranscriptTab({
             </span>
             <select
               id="translate-target"
+              aria-label="Translation language"
               value={targetLanguage}
               onChange={(e) => setTargetLanguage(e.target.value)}
               className="text-sm border border-ink-200 rounded-lg px-2 py-1.5 bg-white min-w-0 flex-1 sm:flex-none"
@@ -568,6 +696,9 @@ function TranscriptTab({
         )}
       </div>
       <div className="card p-6">
+        <ExportText text={translatedText || segments.map((segment) => `[${formatTimestamp(segment.start)}] ${segment.text}`).join("\n")} filename="yt-studio-transcript.txt" />
+        {!translatedText && <input aria-label="Search transcript" className="input mb-4 text-sm" placeholder="Find a word or moment…" value={search} onChange={(event) => setSearch(event.target.value)} />}
+        {!translatedText && search && <p className="text-xs text-ink-600 mb-3">{visibleSegments.length} matching segments</p>}
         <div className="max-h-[600px] overflow-y-auto">
           {translatedText ? (
             // dir="auto" lets the browser pick the paragraph direction from the
@@ -583,11 +714,11 @@ function TranscriptTab({
             // line. Separating the cells keeps timestamps in a left column for
             // every script, and lets each caption lay itself out.
             <div className="text-sm text-ink-700 leading-relaxed">
-              {segments.map((seg, i) => (
+              {visibleSegments.map((seg, i) => (
                 <div key={i} className="flex gap-3 py-0.5">
-                  <span className="shrink-0 text-ink-400 font-mono text-xs pt-0.5 tabular-nums select-none">
+                  <button aria-label={`Seek to ${formatTimestamp(seg.start)}`} onClick={() => onSeek(seg.start)} className="shrink-0 text-ink-400 font-mono text-xs pt-0.5 tabular-nums select-none">
                     {formatTimestamp(seg.start)}
-                  </span>
+                  </button>
                   <span dir="auto" className="min-w-0 flex-1">{seg.text}</span>
                 </div>
               ))}
@@ -628,8 +759,8 @@ function ChatTab({ messages, input, setInput, onSend, loading, hasTranscript }: 
             {loading && <div className="flex justify-start"><div className="bg-ink-100 rounded-2xl px-4 py-2.5"><Loader2 className="w-4 h-4 animate-spin text-ink-400" /></div></div>}
           </div>
           <div className="flex gap-2 pt-4 border-t border-ink-100 mt-4">
-            <input value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && onSend()} placeholder="Ask about the video..." className="input flex-1" disabled={loading} />
-            <button onClick={onSend} className="btn-primary" disabled={loading || !input.trim()}><Send className="w-4 h-4" /></button>
+            <input maxLength={4000} aria-label="Question about the video" value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && !e.nativeEvent.isComposing && onSend()} placeholder="Ask about the video..." className="input flex-1" disabled={loading} />
+            <button aria-label="Send message" onClick={onSend} className="btn-primary" disabled={loading || !input.trim()}><Send className="w-4 h-4" /></button>
           </div>
         </>
       )}
@@ -637,9 +768,11 @@ function ChatTab({ messages, input, setInput, onSend, loading, hasTranscript }: 
   );
 }
 
-function SummaryTab({ summary, loading, type, setType, onRegenerate }: {
+function SummaryTab({ summary, loading, type, setType, onRegenerate, hasTranscript }: {
   summary: string; loading: boolean; type: "brief" | "detailed" | "bullet" | "takeaways";
-  setType: (t: "brief" | "detailed" | "bullet" | "takeaways") => void; onRegenerate: () => void;
+  setType: (t: "brief" | "detailed" | "bullet" | "takeaways") => void;
+  onRegenerate: (type?: "brief" | "detailed" | "bullet" | "takeaways") => void;
+  hasTranscript: boolean;
 }) {
   const types = [
     { id: "brief" as const, label: "Brief", icon: FileText },
@@ -651,27 +784,37 @@ function SummaryTab({ summary, loading, type, setType, onRegenerate }: {
     <div>
       <div className="flex gap-2 mb-6 flex-wrap">
         {types.map((t) => (
-          <button key={t.id} onClick={() => { setType(t.id); if (type !== t.id) onRegenerate(); }}
+          <button key={t.id} disabled={loading || !hasTranscript} onClick={() => { setType(t.id); if (type !== t.id) onRegenerate(t.id); }}
             className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${type === t.id ? "bg-ink-900 text-white" : "bg-ink-100 text-ink-600 hover:bg-ink-200"}`}>{t.label}</button>
         ))}
       </div>
+      {hasTranscript && !loading && <button className="btn-secondary mb-4" onClick={() => onRegenerate(type)}>{summary ? "Regenerate summary" : "Generate summary"}</button>}
+      {!hasTranscript && !loading && (
+        <div className="card p-6 text-center">
+          <FileText className="w-8 h-8 text-ink-300 mx-auto mb-3" />
+          <p className="text-sm text-ink-400">A transcript is required to generate a summary.</p>
+        </div>
+      )}
       {loading && <div className="flex items-center gap-3 text-ink-400"><Loader2 className="w-5 h-5 animate-spin" /><span className="text-sm">Generating summary...</span></div>}
-      {!loading && summary && <div className="card p-6 animate-fade-in"><div className="whitespace-pre-wrap text-sm text-ink-700 leading-relaxed">{summary}</div></div>}
+      {!loading && summary && <div className="card p-6 animate-fade-in"><ExportText text={summary} filename="yt-studio-summary.txt" /><div dir="auto" className="whitespace-pre-wrap text-sm text-ink-700 leading-relaxed">{summary}</div></div>}
     </div>
   );
 }
 
-function ViralTab({ shorts, loading, onRegenerate }: { shorts: ViralShort[]; loading: boolean; onRegenerate: () => void }) {
+function ViralTab({ shorts, loading, onRegenerate, hasTranscript }: { shorts: ViralShort[]; loading: boolean; onRegenerate: () => void; hasTranscript: boolean }) {
   return (
     <div>
       <div className="flex items-center justify-between mb-6">
         <p className="text-sm text-ink-500">AI-generated short-form content ideas from this video</p>
-        {shorts.length > 0 && <button onClick={onRegenerate} className="btn-ghost text-xs">↻ Regenerate</button>}
+        <button disabled={loading || !hasTranscript} onClick={onRegenerate} className="btn-secondary text-xs">{shorts.length ? "Regenerate ideas" : "Generate ideas"}</button>
       </div>
+      {!hasTranscript && <p className="text-sm text-ink-600">A transcript is required to generate clip ideas.</p>}
+      <p className="text-xs text-ink-600 mb-4">Produces scripts and suggested timestamps. Video rendering and editing are not included; scores are AI estimates.</p>
       {loading && <div className="flex items-center gap-3 text-ink-400"><Loader2 className="w-5 h-5 animate-spin" /><span className="text-sm">Finding viral moments...</span></div>}
       <div className="space-y-4">
         {shorts.map((short, i) => (
           <div key={i} className="card p-5 animate-slide-up" style={{ animationDelay: `${i * 100}ms` }}>
+            <ExportText text={`${short.title}\n${formatTimestamp(short.startTime)} – ${formatTimestamp(short.endTime)}\n\nHook: ${short.hook}\n\n${short.script}\n\n${short.captions.join("\n")}\n\n${short.hashtags.join(" ")}\n\nThumbnail: ${short.thumbnailSuggestion}`} filename={`yt-studio-clip-${i + 1}.txt`} />
             <div className="flex items-start justify-between mb-3">
               <div>
                 <h3 className="font-semibold text-base">{short.title}</h3>
@@ -696,7 +839,7 @@ function ViralTab({ shorts, loading, onRegenerate }: { shorts: ViralShort[]; loa
   );
 }
 
-function DownloadTab({ info, loading }: { info: DownloadInfo | null; loading: boolean }) {
+function DownloadTab({ info, loading, onRetry }: { info: DownloadInfo | null; loading: boolean; onRetry: () => void }) {
   const [copied, setCopied] = useState(false);
 
   if (loading) {
@@ -707,7 +850,7 @@ function DownloadTab({ info, loading }: { info: DownloadInfo | null; loading: bo
       </div>
     );
   }
-  if (!info) return null;
+  if (!info) return <button className="btn-secondary" onClick={onRetry}>Retry download options</button>;
 
   async function copyLink() {
     try {
@@ -728,6 +871,7 @@ function DownloadTab({ info, loading }: { info: DownloadInfo | null; loading: bo
         <div className="flex items-center gap-2">
           <input
             id="download-video-url"
+            aria-label="Video link to copy"
             readOnly
             value={info.videoUrl}
             onFocus={(e) => e.currentTarget.select()}

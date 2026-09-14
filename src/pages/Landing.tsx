@@ -1,16 +1,16 @@
 import { Link } from "react-router-dom";
 import {
   Play, Sparkles, MessageCircle, Scissors, FileText, Languages,
-  Link2, MousePointerClick, Zap, ArrowRight, ChevronDown, Clock,
+  Link2, MousePointerClick, Zap, ArrowRight, ChevronDown, Clock, Bookmark,
 } from "lucide-react";
 
 const FEATURES = [
-  { icon: Play, title: "Watch & download", desc: "Stream the video right on the page or grab video/audio download links instantly.", color: "bg-ink-100 text-ink-700" },
-  { icon: FileText, title: "Full transcripts", desc: "Accurate, timestamped transcripts pulled straight from YouTube's own captions.", color: "bg-blue-50 text-blue-600" },
+  { icon: Bookmark, title: "History & saved videos", desc: "Return to your last 100 videos, search by title or channel, and bookmark your favorites in this browser.", color: "bg-ink-100 text-ink-700" },
+  { icon: FileText, title: "Searchable transcripts", desc: "Read available YouTube captions, click timestamps to seek, and copy or download the full text.", color: "bg-blue-50 text-blue-600" },
   { icon: Languages, title: "19-language translation", desc: "Translate any transcript into Spanish, Arabic, Japanese, Hindi and 15 more.", color: "bg-purple-50 text-purple-600" },
   { icon: MessageCircle, title: "Chat with the video", desc: "Ask anything and get answers grounded in exactly what was said, with timestamps.", color: "bg-green-50 text-green-600" },
   { icon: Sparkles, title: "Instant summaries", desc: "Brief, detailed, bullet-point, or key-takeaway summaries generated in seconds.", color: "bg-amber-50 text-amber-600" },
-  { icon: Scissors, title: "Viral shorts generator", desc: "AI finds the best clips and writes hooks, scripts, captions & hashtags for you.", color: "bg-rose-50 text-rose-600" },
+  { icon: Scissors, title: "Short-form clip ideas", desc: "Get suggested moments, hooks, scripts, captions, and hashtags. Export the text to use in your editor.", color: "bg-rose-50 text-rose-600" },
 ];
 
 const STEPS = [
@@ -20,10 +20,10 @@ const STEPS = [
 ];
 
 const FAQS = [
-  { q: "Do I need to create an account?", a: "No. YT Studio is completely free and works entirely in your browser — just paste a link and go." },
+  { q: "Do I need to create an account?", a: "No account is needed. Video history and bookmarks are saved in this browser; AI requests are processed by the server. Clearing browser data removes your history. It does not sync across devices." },
   { q: "Which languages are supported?", a: "Transcripts can be translated into 19 languages, including Spanish, Arabic, Hindi, Japanese, Korean, Portuguese, and more." },
-  { q: "Does this work on videos without captions?", a: "Chat, summaries, and translation need an existing transcript. Watching and downloading work on any public video regardless." },
-  { q: "Is downloading videos allowed?", a: "Download links are provided for educational use only — please respect YouTube's Terms of Service and creator copyright." },
+  { q: "Does this work on videos without captions?", a: "Chat, summaries, translation, and clip ideas require captions. YouTube restrictions or rate limits can prevent access. Watching depends on whether the creator allows embedded playback." },
+  { q: "Can I download the results?", a: "Yes — transcripts, translations, summaries, and clip scripts can be downloaded as text. Finished video clips are not rendered here. Video and audio downloads use external tools; only download content you have permission to use." },
 ];
 
 export default function Landing() {
@@ -44,7 +44,7 @@ export default function Landing() {
             <a href="#faq" className="hover:text-ink-900 transition-colors">FAQ</a>
           </div>
           <Link to="/studio" className="btn-primary text-sm">
-            Try it free →
+            Open studio →
           </Link>
         </div>
       </nav>
@@ -57,7 +57,7 @@ export default function Landing() {
         <div className="relative max-w-4xl mx-auto px-6 pt-24 pb-16 text-center">
           <div className="badge bg-ink-100 text-ink-600 mb-6 animate-fade-in">
             <Sparkles className="w-3 h-3" />
-            Free tool — no account needed
+            Your video workspace — no account needed
           </div>
           <h1 className="text-5xl md:text-6xl font-bold tracking-tight mb-6 leading-[1.1] animate-slide-up">
             One link. Every insight
@@ -66,12 +66,12 @@ export default function Landing() {
           </h1>
           <p className="text-lg text-ink-500 mb-8 max-w-2xl mx-auto animate-slide-up">
             Paste a YouTube URL and chat with it like ChatGPT, pull instant AI summaries,
-            translate transcripts into 19 languages, and turn it into viral shorts —
-            all in one clean tool.
+            translate transcripts, and plan your next short-form clip.
+            Keep your favorite videos close with local history and bookmarks.
           </p>
           <div className="flex flex-col sm:flex-row items-center justify-center gap-3 mb-10">
             <Link to="/studio" className="btn-primary text-base px-8 py-3 w-full sm:w-auto">
-              Get started — it's free
+              Get started
             </Link>
             <a href="#how-it-works" className="btn-secondary text-base px-8 py-3 w-full sm:w-auto">
               See how it works
@@ -82,7 +82,7 @@ export default function Landing() {
             <span className="w-1 h-1 rounded-full bg-ink-300" />
             <span>No credit card</span>
             <span className="w-1 h-1 rounded-full bg-ink-300" />
-            <span>Runs in your browser</span>
+            <span>Local video history</span>
           </div>
         </div>
       </div>
@@ -94,7 +94,7 @@ export default function Landing() {
             <span className="w-3 h-3 rounded-full bg-ink-200" />
             <span className="w-3 h-3 rounded-full bg-ink-200" />
             <span className="w-3 h-3 rounded-full bg-ink-200" />
-            <span className="ml-3 text-xs text-ink-400 font-mono truncate">youtube-studio.app/studio</span>
+            <span className="ml-3 text-xs text-ink-400 font-mono truncate">YT Studio · Illustrative preview</span>
           </div>
           <div className="flex gap-1 px-4 pt-4 border-b border-ink-100 overflow-x-auto">
             {["Watch", "Transcript", "Chat", "Summary", "Viral Shorts", "Download"].map((tab, i) => (
@@ -125,7 +125,7 @@ export default function Landing() {
             <div className="card p-4 bg-ink-50/50">
               <div className="flex items-center justify-between mb-2">
                 <h3 className="font-semibold text-sm">Hook, 0:42 – 1:10</h3>
-                <span className="badge bg-green-50 text-green-600 text-xs">Viral score: 92/100</span>
+                <span className="badge bg-green-50 text-green-600 text-xs">Example clip idea</span>
               </div>
               <p className="text-xs text-ink-400 mb-2 flex items-center gap-1"><Clock className="w-3 h-3" />28s clip</p>
               <p className="text-sm bg-amber-50 rounded-lg p-2 mb-2">"This one mistake is costing you customers..."</p>
@@ -205,10 +205,10 @@ export default function Landing() {
             Ready to get more out of every video?
           </h2>
           <p className="text-ink-300 mb-8 max-w-lg mx-auto">
-            Paste a link and see it in action — free, instant, no account required.
+            A place to watch, understand, and return to the videos that matter.
           </p>
           <Link to="/studio" className="inline-flex items-center gap-2 bg-white text-ink-900 font-medium text-base px-8 py-3 rounded-lg hover:bg-ink-100 transition-all active:scale-[0.98]">
-            Start now — it's free
+            Open your workspace
             <ArrowRight className="w-4 h-4" />
           </Link>
         </div>

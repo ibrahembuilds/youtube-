@@ -14,6 +14,9 @@
     }
   ],
   "functions": {
+    "api/transcript.js": {
+      "maxDuration": 60
+    },
     "api/viral.js": {
       "maxDuration": 60
     },

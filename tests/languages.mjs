@@ -10,7 +10,7 @@ import path from "node:path";
 import { group, check, summarise } from "./harness.mjs";
 import { startProdServer } from "./prod-server.mjs";
 const PORT=4183, BASE=`http://localhost:${PORT}`;
-function findChrome(){const r=process.env.PLAYWRIGHT_BROWSERS_PATH;if(!r)return null;
+function findChrome(){if(process.env.CHROME_PATH)return process.env.CHROME_PATH;const r=process.env.PLAYWRIGHT_BROWSERS_PATH;if(!r)return null;
  for(const d of fs.readdirSync(r)){if(!d.startsWith("chromium-"))continue;
  const c=path.join(r,d,"chrome-linux/chrome");if(fs.existsSync(c))return c;}return null;}
 

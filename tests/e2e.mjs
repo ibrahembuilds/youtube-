@@ -228,7 +228,7 @@ try {
     const { ctx, page } = await newPage();
     await page.goto(BASE, { waitUntil: "domcontentloaded" });
     check("hero renders", /One link\. Every insight/.test((await page.textContent("h1")) || ""));
-    await page.click("a[href='/studio']:has-text('Try it free')");
+    await page.click("a[href='/studio']:has-text('Open studio')");
     await page.waitForURL("**/studio");
     check("navigates to the studio", page.url().endsWith("/studio"));
     check("no uncaught page errors", page.__errors.length === 0, page.__errors.join(" | "));
@@ -236,7 +236,7 @@ try {
     await page.goto(`${BASE}/does-not-exist`, { waitUntil: "domcontentloaded" });
     await page.waitForTimeout(300);
     check("an unknown route renders something", ((await page.textContent("body")) || "").trim().length > 0,
-      "no catch-all <Route> is defined, so the page is completely blank", "F17");
+      "an unknown route must show a recovery link");
     await ctx.close();
   }
 
@@ -278,7 +278,7 @@ try {
     await page.click("button:has-text('Detailed')");
     await page.waitForTimeout(600);
     check("summary sends the type that was clicked", sent[1] === "detailed",
-      `clicked "Detailed", sent type="${sent[1]}" — handleSummary reads state that has not committed yet`, "F05");
+      `clicked "Detailed", sent type="${sent[1]}"`);
     await ctx.close();
   }
   {
@@ -288,13 +288,13 @@ try {
     await loadVideo(page);
     const badge = ((await page.locator(".badge.bg-green-50").textContent().catch(() => "")) || "").replace(/\s+/g, " ").trim();
     check("header badge reflects what actually loaded", !/1 language/.test(badge),
-      `shows "${badge}" with zero transcripts loaded`, "F10");
+      `shows "${badge}" with zero transcripts loaded`);
 
     await page.click("button:has-text('Chat')");
     await page.waitForTimeout(300);
     check("chat is gated when no transcript is usable",
       (await page.locator("text=Chat requires captions").count()) > 0,
-      "input is shown but Send is a silent no-op — the gate tests selectedTrack, handleChat tests transcriptText", "F11");
+      "chat must be unavailable when caption content could not be loaded");
     await ctx.close();
   }
 
@@ -305,7 +305,7 @@ try {
     await page.click("button:has-text('Download')");
     await page.waitForTimeout(4000);
 
-    const links = await page.locator("a[target='_blank']").evaluateAll((els) =>
+    const links = await page.locator(".tool-column a[target='_blank']").evaluateAll((els) =>
       els.map((e) => ({ href: e.href, label: e.querySelector("p")?.textContent || "" })));
 
     // YouTube signs and ciphers its media URLs, so nothing here can hand the
@@ -404,6 +404,124 @@ try {
       (await page.evaluate(() => [...document.querySelectorAll("input,select,button")]
         .filter((e) => !e.getAttribute("aria-label") && !e.textContent.trim()
           && !e.getAttribute("placeholder") && !document.querySelector(`label[for="${e.id}"]`)).length)) === 0);
+    await ctx.close();
+  }
+  group("History, bookmarks, and browser-local persistence");
+  {
+    const { ctx, page } = await newPage({ sources: { direct: XML } });
+    await loadVideo(page);
+    await page.getByRole("button", { name: "History", exact: false }).first().click();
+    check("a loaded video appears in history", await page.locator(".history-card").count() === 1);
+    await page.getByRole("button", { name: "Save Test Video", exact: true }).click();
+    await page.reload();
+    await page.getByRole("button", { name: "History", exact: false }).first().click();
+    check("history survives a page reload", await page.locator(".history-card").count() === 1);
+    check("bookmarks survive a page reload", await page.getByRole("button", { name: "Unsave Test Video", exact: true }).getAttribute("aria-pressed") === "true");
+    await page.getByLabel("Search history").fill("no such channel");
+    check("history search filters results", await page.locator(".history-card").count() === 0);
+    await page.getByLabel("Search history").fill("Test Channel");
+    check("history search matches channel names", await page.locator(".history-card").count() === 1);
+    await page.getByRole("button", { name: "Open Test Video", exact: true }).click();
+    await page.waitForFunction(() => document.querySelector("#video-url")?.value === "TEST1234567");
+    check("reopening history loads the selected video", (await page.locator("iframe").getAttribute("src")).includes("TEST1234567"));
+    await page.getByRole("button", { name: "History", exact: false }).first().click();
+    check("reopening does not duplicate history", await page.locator(".history-card").count() === 1);
+    await fs.promises.mkdir("docs/screenshots", { recursive: true });
+    await page.screenshot({ path: "docs/screenshots/history-desktop.png", fullPage: true });
+    await page.getByRole("button", { name: "Remove Test Video", exact: true }).click();
+    await page.reload();
+    await page.getByRole("button", { name: "History", exact: false }).first().click();
+    check("removing a video persists", await page.locator(".history-card").count() === 0);
+    await ctx.close();
+  }
+
+  group("Transcript search, seeking, translation, and exports");
+  {
+    const { ctx, page } = await newPage({ sources: { direct: XML } });
+    await loadVideo(page);
+    await page.getByLabel("Search transcript").fill("consistency");
+    check("transcript search keeps matching text", (await transcriptText(page)).includes("consistency") && !(await transcriptText(page)).includes("Welcome"));
+    await page.getByRole("button", { name: "Seek to 1:05", exact: true }).click();
+    check("timestamp seeks the persistent player", (await page.locator("iframe").getAttribute("src")).includes("start=65"));
+    const downloadPromise = page.waitForEvent("download");
+    await page.getByRole("button", { name: "Download text", exact: true }).click();
+    const download = await downloadPromise;
+    const path = await download.path();
+    const exported = await fs.promises.readFile(path, "utf8");
+    check("export includes the full transcript even with a search filter", exported.includes("Welcome") && exported.includes("consistency"));
+    await page.route(`${BASE}/api/translate`, (route) => route.fulfill({ json: { translatedText: "مرحبا هذا نص مترجم" } }));
+    await page.getByRole("button", { name: "Translate", exact: true }).click();
+    await page.getByText("مرحبا هذا نص مترجم", { exact: true }).waitFor();
+    check("translation response renders with automatic direction", await page.getByText("مرحبا هذا نص مترجم", { exact: true }).getAttribute("dir") === "auto");
+    await page.selectOption("#translate-target", "French");
+    check("changing translation language clears the previous result", await page.getByText("مرحبا هذا نص مترجم", { exact: true }).count() === 0);
+    await ctx.close();
+  }
+
+  group("Chat and AI error recovery (simulated provider responses)");
+  {
+    const { ctx, page } = await newPage({ sources: { direct: XML } });
+    await loadVideo(page);
+    await page.route(`${BASE}/api/chat`, (route) => route.fulfill({ status: 503, json: { error: "Provider unavailable" } }));
+    await page.getByRole("button", { name: "Chat", exact: true }).click();
+    await page.getByLabel("Question about the video").fill("What is the key point?");
+    await page.getByLabel("Send message").click();
+    await page.getByRole("alert").filter({ hasText: "Provider unavailable" }).waitFor();
+    check("chat failure restores the question for retry", await page.getByLabel("Question about the video").inputValue() === "What is the key point?");
+    await page.route(`${BASE}/api/chat`, (route) => route.fulfill({ json: { response: "At 1:05, the key point is consistency." } }));
+    await page.getByLabel("Send message").click();
+    await page.getByText("At 1:05, the key point is consistency.", { exact: true }).waitFor();
+    check("chat response is displayed", true);
+    await page.route(`${BASE}/api/summary`, (route) => route.fulfill({ status: 500, json: { error: "Summary unavailable" } }));
+    await page.getByRole("button", { name: "Summary", exact: true }).click();
+    await page.getByRole("alert").filter({ hasText: "Summary unavailable" }).waitFor();
+    check("failed summary offers a retry", await page.getByRole("button", { name: "Generate summary", exact: true }).isEnabled());
+    await page.route(`${BASE}/api/summary`, (route) => route.fulfill({ json: { response: "Recovered summary" } }));
+    await page.getByRole("button", { name: "Generate summary", exact: true }).click();
+    await page.getByText("Recovered summary", { exact: true }).waitFor();
+    check("summary recovers after retry", true);
+    await page.route(`${BASE}/api/viral`, (route) => route.fulfill({ status: 500, json: { error: "Ideas unavailable" } }));
+    await page.getByRole("button", { name: "Viral Shorts", exact: true }).click();
+    await page.getByRole("alert").filter({ hasText: "Ideas unavailable" }).waitFor();
+    check("failed clip generation offers a retry", await page.getByRole("button", { name: "Generate ideas", exact: true }).isEnabled());
+    await page.route(`${BASE}/api/viral`, (route) => route.fulfill({ json: { shorts: [{ title: "A useful moment", startTime: 10, endTime: 40, script: "Be consistent.", hook: "Start here", captions: ["Practice"], hashtags: ["#learning"], thumbnailSuggestion: "A notebook", reason: "Actionable", viralScore: 70 }] } }));
+    await page.getByRole("button", { name: "Generate ideas", exact: true }).click();
+    await page.getByText("A useful moment", { exact: true }).waitFor();
+    check("clip generation renders the complete response", await page.getByText("#learning", { exact: true }).count() === 1);
+    await ctx.close();
+  }
+
+  group("Slow responses cannot replace another video's results");
+  {
+    const { ctx, page } = await newPage({ sources: { direct: XML } });
+    await loadVideo(page);
+    let pending;
+    await page.route(`${BASE}/api/summary`, (route) => { pending = route; });
+    await page.getByRole("button", { name: "Summary", exact: true }).click();
+    await page.waitForFunction(() => document.body.textContent.includes("Generating summary"));
+    await page.fill("#video-url", "dQw4w9WgXcQ");
+    await page.getByRole("button", { name: "Load Video", exact: true }).click();
+    await page.waitForFunction(() => document.querySelector("iframe")?.src.includes("dQw4w9WgXcQ"));
+    await pending.fulfill({ json: { response: "STALE ANSWER FROM PREVIOUS VIDEO" } });
+    await page.getByRole("button", { name: "Summary", exact: true }).click();
+    await page.waitForTimeout(150);
+    check("previous video response is discarded", await page.getByText("STALE ANSWER FROM PREVIOUS VIDEO", { exact: true }).count() === 0);
+    await ctx.close();
+  }
+
+  group("Workspace visual checks at 1440, 768, 390, and 320px");
+  {
+    const { ctx, page } = await newPage({ sources: { direct: XML } });
+    for (const width of [1440, 768, 390, 320]) {
+      await page.setViewportSize({ width, height: 960 });
+      await page.goto(`${BASE}/studio`);
+      check(`empty studio fits at ${width}px`, await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+      if (width === 1440 || width === 390) await page.screenshot({ path: `docs/screenshots/studio-${width}.png`, fullPage: true });
+      await loadVideo(page);
+      check(`loaded studio fits at ${width}px`, await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+      if (width === 1440) await page.screenshot({ path: "docs/screenshots/transcript-desktop.png", fullPage: true });
+    }
+    check("no uncaught exceptions across responsive flows", page.__errors.length === 0, page.__errors.join(" | "));
     await ctx.close();
   }
 } finally {
