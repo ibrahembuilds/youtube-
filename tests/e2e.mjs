@@ -52,6 +52,10 @@ const JSON3 = JSON.stringify({ events: [
   { tStartMs: 3725000, dDurationMs: 2500, segs: [{ utf8: "And that is a wrap" }] },
 ] });
 
+// Caption-text sources, in the order the app should try them. The shared
+// order log also records the metadata lookups (innertube, server-meta).
+const CONTENT_SOURCES = ["server", "direct", "direct-json3", "same-origin-proxy", "cors-proxy"];
+
 const TRACK_URL = "https://www.youtube.com/api/timedtext?v=TEST1234567&lang=en";
 const META = {
   tracks: [{
@@ -126,14 +130,37 @@ async function newPage({ sources = {} } = {}) {
     if (url.includes("/api/timedtext") && url.includes("fmt=json3")) { order.push("direct-json3"); return reply(route, sources.directJson3); }
     if (url.includes("/api/timedtext")) { order.push("direct"); return reply(route, sources.direct); }
 
+    if (url.includes("youtubei/v1/player")) {
+      order.push("innertube");
+      const spec = sources.innertube;
+      if (!spec || spec === "fail") return route.fulfill({ status: 500, body: "" });
+      if (spec === "blocked")
+        return route.fulfill({ status: 200, contentType: "application/json",
+          body: JSON.stringify({ playabilityStatus: { status: "LOGIN_REQUIRED", reason: "Sign in to confirm you're not a bot" } }) });
+      if (spec === "no-captions")
+        return route.fulfill({ status: 200, contentType: "application/json",
+          body: JSON.stringify({ playabilityStatus: { status: "OK" }, captions: {} }) });
+      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+        playabilityStatus: { status: "OK" },
+        captions: { playerCaptionsTracklistRenderer: { captionTracks: [
+          { baseUrl: TRACK_URL, languageCode: "en", isTranslatable: true, name: { simpleText: "English" } },
+        ] } },
+      }) });
+    }
     if (url.includes("/oembed")) return route.fulfill({ status: 200, contentType: "application/json",
       body: JSON.stringify({ title: "Test Video", author_name: "Test Channel", author_url: "", thumbnail_url: "" }) });
     if (url.includes("/embed/")) return route.fulfill({ status: 200, contentType: "text/html", body: "<html></html>" });
     return route.fulfill({ status: 204, body: "" });
   });
 
-  await page.route(`${BASE}/api/transcript`, (r) =>
-    r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(META) }));
+  await page.route(`${BASE}/api/transcript`, (r) => {
+    order.push("server-meta");
+    const spec = sources.serverMeta;
+    if (spec === "bot_check")
+      return r.fulfill({ status: 429, contentType: "application/json",
+        body: JSON.stringify({ error: "YouTube is challenging this server with a bot check.", code: "bot_check" }) });
+    return r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(META) });
+  });
 
   await page.route(`${BASE}/api/captions`, (r) => {
     order.push("server");
@@ -167,6 +194,54 @@ const transcriptText = (page) =>
   page.locator(".card.p-6 .overflow-y-auto").first().textContent().catch(() => "");
 
 try {
+  group("Caption lookup asks the browser before the server");
+  {
+    // Measured against the live deployment: 12 of 12 fresh server-side lookups
+    // returned bot_check, because YouTube blocks the watch page from datacenter
+    // IPs. InnerTube answers cross-origin, so the viewer's own IP can be used.
+    const a = await newPage({ sources: { innertube: "ok", direct: XML } });
+    await loadVideo(a.page);
+    check("the browser asks YouTube directly first",
+      a.page.__order[0] === "innertube", `order=${JSON.stringify(a.page.__order)}`);
+    check("and never touches the server endpoint when that works",
+      !a.page.__order.includes("server-meta"), `order=${JSON.stringify(a.page.__order)}`);
+    check("the transcript still renders",
+      /Welcome to the show/.test(await transcriptText(a.page)));
+    await a.ctx.close();
+
+    // A browser that is itself challenged must not dead-end.
+    const b = await newPage({ sources: { innertube: "blocked", direct: XML } });
+    await loadVideo(b.page);
+    check("a challenged browser falls back to the server",
+      b.page.__order.includes("server-meta"), `order=${JSON.stringify(b.page.__order)}`);
+    check("and the transcript still renders",
+      /Welcome to the show/.test(await transcriptText(b.page)));
+    await b.ctx.close();
+
+    const c = await newPage({ sources: { innertube: "fail", direct: XML } });
+    await loadVideo(c.page);
+    check("a network failure also falls back",
+      c.page.__order.includes("server-meta"), `order=${JSON.stringify(c.page.__order)}`);
+    await c.ctx.close();
+  }
+
+  group("When both lookups fail, the server's classified error is what shows");
+  {
+    const { ctx, page } = await newPage({
+      sources: { innertube: "blocked", serverMeta: "bot_check" },
+    });
+    await page.goto(`${BASE}/studio`, { waitUntil: "domcontentloaded" });
+    await page.fill("input[placeholder='Paste YouTube link here...']", "https://www.youtube.com/watch?v=TEST1234567");
+    await page.click("button:has-text('Load Video')");
+    await page.waitForTimeout(4000);
+    const err = (await page.locator("p.text-red-500").first().textContent().catch(() => "")) || "";
+    check("the bot-check message reaches the user", /bot check/i.test(err), `showed: "${err.slice(0, 80)}"`);
+    check("and a Try again button is offered",
+      (await page.locator("button:has-text('Try again')").count()) > 0,
+      "bot_check clears on its own, so retrying can work");
+    await ctx.close();
+  }
+
   group("F01 — routing");
   {
     const hit = resolveRewrite("/yt-timedtext");
@@ -201,22 +276,28 @@ try {
   {
     const { ctx, page } = await newPage({ sources: { server: JSON3 } });
     await loadVideo(page);
+    // `order` also records the metadata lookup, so filter to the caption
+    // sources this group is actually about.
+    const contentOrder = page.__order.filter((s) => CONTENT_SOURCES.includes(s));
     check("tries the server (PO token) path first",
-      page.__order[0] === "server",
-      `order=${JSON.stringify(page.__order)} — exp=xpe caption URLs are empty without a token only the server can mint`);
-    check("stops as soon as a source works", page.__order.length === 1,
-      `order=${JSON.stringify(page.__order)}`);
+      contentOrder[0] === "server",
+      `content sources=${JSON.stringify(contentOrder)} — exp=xpe caption URLs are empty without a token only the server can mint`);
+    check("stops as soon as a source works", contentOrder.length === 1,
+      `content sources=${JSON.stringify(contentOrder)}`);
     check("renders the server's json3 captions",
       /Welcome to the show/.test(await transcriptText(page)),
-      `order=${JSON.stringify(page.__order)}`);
+      `content sources=${JSON.stringify(contentOrder)}`);
     await ctx.close();
   }
   {
     const { ctx, page } = await newPage({ sources: { direct: XML } });
     await loadVideo(page);
+    const contentOrder = page.__order.filter((s) => CONTENT_SOURCES.includes(s));
     check("falls back to the direct browser fetch when the server fails",
-      page.__order[0] === "server" && page.__order[1] === "direct" && page.__order.length === 2,
-      `order=${JSON.stringify(page.__order)}`);
+      contentOrder[0] === "server" && contentOrder[1] === "direct",
+      `content sources=${JSON.stringify(contentOrder)} — the viewer's own IP is the least throttled browser path`);
+    check("stops as soon as a source works", contentOrder.length === 2,
+      `content sources=${JSON.stringify(contentOrder)}`);
     await ctx.close();
   }
 
@@ -242,8 +323,9 @@ try {
     const shown = await page.locator("text=Could not load transcript").count();
     check("all sources failing shows an explicit empty state", shown > 0,
       "the user must not be left with a silently blank transcript");
-    check("every source was attempted", page.__order.length === 5,
-      `order=${JSON.stringify(page.__order)}`);
+    const contentOrder = page.__order.filter((s) => CONTENT_SOURCES.includes(s));
+    check("every source was attempted", contentOrder.length === 5,
+      `content sources=${JSON.stringify(contentOrder)}`);
     await ctx.close();
   }
 
