@@ -19,7 +19,7 @@ History and bookmarks use this browser's localStorage, with no account or cross-
 - Tailwind CSS (clean minimal design)
 - Vercel Serverless Functions (API)
 - OpenRouter for AI (model per task, set by env var)
-- YouTube timedtext API for transcripts
+- YouTube timedtext API for transcripts, with BotGuard PO tokens minted server-side (bgutils-js + jsdom)
 
 ## Setup
 
@@ -40,6 +40,7 @@ History and bookmarks use this browser's localStorage, with no account or cross-
 | `AI_MODEL_SUMMARY` | no | Model for summaries (default `openai/gpt-5-nano`). |
 | `AI_MODEL_VIRAL` | no | Model for viral shorts (default `openai/gpt-5-mini`). |
 | `AI_MODEL_TRANSLATE` | no | Model for translation (default `openai/gpt-5-mini`). |
+| `YOUTUBE_PROXY_URL` | yes, in production | Rotating residential proxy for all YouTube requests, e.g. `http://USER-rotate:PASS@p.webshare.io:80`. Without it, Vercel's datacenter IPs get bot-checked and captions fail. |
 | `ALLOWED_ORIGINS` | no | Extra browser origins allowed to call `/api/*`. Same-origin is always allowed. |
 | `RATE_LIMIT_MAX` | no | Per-IP requests per window (default 20). |
 | `RATE_LIMIT_WINDOW_MS` | no | Window length in ms (default 60000). |
@@ -47,6 +48,19 @@ History and bookmarks use this browser's localStorage, with no account or cross-
 The rate-limit counter lives in each serverless instance's memory, so the real
 ceiling is `warm instances x RATE_LIMIT_MAX`. Use a shared store (Redis/Upstash)
 if you need a hard cap.
+
+### How captions are fetched
+
+Two things block a server from reading YouTube captions, and each has its own fix:
+
+1. **PO tokens.** Caption URLs carry `exp=xpe`, and YouTube answers them with
+   HTTP 200 and an empty body unless the request includes `&pot=<token>&c=WEB`.
+   `api/_youtube.js` mints that token with BotGuard (bgutils-js in jsdom), bound
+   to the video id, and `api/captions.js` attaches it. Browser-side fetches
+   cannot do this, so they are only fallbacks.
+2. **IP blocking.** YouTube bot-checks datacenter IPs. Set `YOUTUBE_PROXY_URL`
+   to a rotating residential proxy. Each video costs one watch page (~1.3MB) plus
+   ~50KB per caption track of proxy bandwidth.
 
 ## Tests
 

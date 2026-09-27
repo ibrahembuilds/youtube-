@@ -31,3 +31,11 @@ The API suite exercises live YouTube caption-track discovery and caching. A sepa
 No OpenRouter key was configured for live AI calls. Provider behavior is covered with fixtures; a deployment with `OPENROUTER_API_KEY` must still be checked against the real provider.
 
 History stores video metadata and bookmarks in this browser, not video files or generated AI results. Reopening videos requires internet access. Text exports download locally; the Download tool offers external services rather than a built-in video downloader. Viral Shorts generates scripts and clip suggestions, not rendered video files.
+
+## Live caption retrieval (2026-09-27)
+
+Measured from this environment's datacenter IP against live YouTube:
+
+- `dQw4w9WgXcQ`'s caption URL carries `exp=xpe`. Without a PO token, timedtext returned HTTP 200 and 0 bytes. Through `/api/captions` with a minted token it returned 61 caption events covering 0–207.9s, in 705ms including building the minter.
+- After about 15 requests the same IP got HTTP 429 on the watch page, and every InnerTube client answered "Sign in to confirm you're not a bot". This is why production needs `YOUTUBE_PROXY_URL`.
+- The proxy code path was checked through an HTTP CONNECT proxy: the homepage and watch page came back through the tunnel with HTTP 200. A Webshare residential pool itself was not available to test.

@@ -17,6 +17,9 @@
     "api/transcript.js": {
       "maxDuration": 60
     },
+    "api/captions.js": {
+      "maxDuration": 30
+    },
     "api/viral.js": {
       "maxDuration": 60
     },

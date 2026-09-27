@@ -1,5 +1,7 @@
 // Shared utilities for Vercel serverless functions
 
+import { youtubeFetch, hasYoutubeProxy } from "./_youtube.js";
+
 const _env = typeof process !== "undefined" ? process.env : {};
 const _key = _env["OPENROUTER" + "_API_KEY"] || "";
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
@@ -238,7 +240,7 @@ function mapCaptionTracks(tracksJson) {
       t.name?.simpleText || t.name?.runs?.[0]?.text || t.languageCode || "Unknown",
     kind: t.kind || "unknown",
     isTranslatable: t.isTranslatable || false,
-    // These URLs must be fetched from the USER'S browser, not from the server
+    // Fetched by /api/captions with a PO token; the browser paths are fallbacks.
     transcriptUrl: t.baseUrl,
     translationLanguages: (t.translationLanguages || []).map((tl) => ({
       languageCode: tl.languageCode,
@@ -386,7 +388,7 @@ export function classifyWatchPage(httpStatus, html) {
 async function fetchCaptionsFromWatchPage(videoId) {
   let res;
   try {
-    res = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+    res = await youtubeFetch(`https://www.youtube.com/watch?v=${videoId}`, {
       headers: {
         "User-Agent": USER_AGENT,
         "Accept-Language": "en-US,en;q=0.9,ar;q=0.8,zh;q=0.7,es;q=0.6,fr;q=0.5",
@@ -442,6 +444,14 @@ export async function fetchAllTranscripts(videoId) {
 
   if (last.kind === "unavailable") {
     throw new TranscriptError("unavailable", last.detail, 422);
+  }
+
+  if ((last.kind === "blocked" || last.kind === "throttled") && !hasYoutubeProxy()) {
+    // For the operator, not the user: this is the misconfiguration to fix.
+    console.error(
+      "YouTube is blocking this server's IP and YOUTUBE_PROXY_URL is not set. " +
+        "Datacenter IPs need a rotating residential proxy — see .env.example."
+    );
   }
 
   if (last.kind === "blocked") {

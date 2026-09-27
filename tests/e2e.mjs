@@ -46,6 +46,12 @@ const XML = `<?xml version="1.0" encoding="utf-8"?><transcript>
 <text start="65.8" dur="4.1">The first key point is consistency</text>
 <text start="3725.0" dur="2.5">And that is a wrap</text></transcript>`;
 
+const JSON3 = JSON.stringify({ events: [
+  { tStartMs: 500, dDurationMs: 3200, segs: [{ utf8: "Welcome " }, { utf8: "to the show" }] },
+  { tStartMs: 65800, dDurationMs: 4100, segs: [{ utf8: "The first key point is consistency" }] },
+  { tStartMs: 3725000, dDurationMs: 2500, segs: [{ utf8: "And that is a wrap" }] },
+] });
+
 const TRACK_URL = "https://www.youtube.com/api/timedtext?v=TEST1234567&lang=en";
 const META = {
   tracks: [{
@@ -77,6 +83,18 @@ function startApi() {
 const api = await startApi();
 const prod = await startProdServer({ port: PORT, apiPort: API_PORT });
 const browser = await chromium.launch(CHROME ? { executablePath: CHROME } : {});
+
+// /api/captions would otherwise reach the real API server and, from there,
+// live YouTube. Every context gets a failing stub by default, so the app falls
+// through to the browser sources those tests control; page-level routes take
+// precedence and override it where a test exercises the server path.
+const newContext = browser.newContext.bind(browser);
+browser.newContext = async (...args) => {
+  const ctx = await newContext(...args);
+  await ctx.route(`${BASE}/api/captions`, (r) =>
+    r.fulfill({ status: 502, contentType: "application/json", body: JSON.stringify({ error: "stubbed", code: "upstream_error" }) }));
+  return ctx;
+};
 
 /**
  * Fresh page with every external host stubbed. `sources` decides what each
@@ -116,6 +134,16 @@ async function newPage({ sources = {} } = {}) {
 
   await page.route(`${BASE}/api/transcript`, (r) =>
     r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(META) }));
+
+  await page.route(`${BASE}/api/captions`, (r) => {
+    order.push("server");
+    const spec = sources.server;
+    if (spec === "hang") return new Promise(() => {});
+    if (typeof spec === "string" && spec.startsWith("{")) {
+      return r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ format: "json3", body: spec }) });
+    }
+    return r.fulfill({ status: 502, contentType: "application/json", body: JSON.stringify({ error: "failed", code: "empty_captions" }) });
+  });
 
   page.__order = order;
   page.__errors = errors;
@@ -171,12 +199,23 @@ try {
 
   group("F01 — source ordering");
   {
+    const { ctx, page } = await newPage({ sources: { server: JSON3 } });
+    await loadVideo(page);
+    check("tries the server (PO token) path first",
+      page.__order[0] === "server",
+      `order=${JSON.stringify(page.__order)} — exp=xpe caption URLs are empty without a token only the server can mint`);
+    check("stops as soon as a source works", page.__order.length === 1,
+      `order=${JSON.stringify(page.__order)}`);
+    check("renders the server's json3 captions",
+      /Welcome to the show/.test(await transcriptText(page)),
+      `order=${JSON.stringify(page.__order)}`);
+    await ctx.close();
+  }
+  {
     const { ctx, page } = await newPage({ sources: { direct: XML } });
     await loadVideo(page);
-    check("tries the direct browser fetch first",
-      page.__order[0] === "direct",
-      `order=${JSON.stringify(page.__order)} — the viewer's own IP is the least throttled path`);
-    check("stops as soon as a source works", page.__order.length === 1,
+    check("falls back to the direct browser fetch when the server fails",
+      page.__order[0] === "server" && page.__order[1] === "direct" && page.__order.length === 2,
       `order=${JSON.stringify(page.__order)}`);
     await ctx.close();
   }
@@ -203,7 +242,7 @@ try {
     const shown = await page.locator("text=Could not load transcript").count();
     check("all sources failing shows an explicit empty state", shown > 0,
       "the user must not be left with a silently blank transcript");
-    check("every source was attempted", page.__order.length === 4,
+    check("every source was attempted", page.__order.length === 5,
       `order=${JSON.stringify(page.__order)}`);
     await ctx.close();
   }

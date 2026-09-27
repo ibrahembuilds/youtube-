@@ -12,6 +12,8 @@ import {
   extractJsonObject, normaliseShorts, MIN_CLIP_SECONDS, MAX_CLIP_SECONDS,
 } from "../api/viral.js";
 import { classifyWatchPage } from "../api/_lib.js";
+import { buildCaptionUrl } from "../api/captions.js";
+import { interpreterUrlFrom } from "../api/_youtube.js";
 
 group("XML caption parsing");
 {
@@ -261,6 +263,51 @@ group("Watch-page classification (F08 decision table)");
   check("the word UNPLAYABLE elsewhere on a healthy page is ignored",
     classifyWatchPage(200, page('"status":"OK"', tracks + ',"someOtherField":"UNPLAYABLE"')).kind === "ok",
     "reads playabilityStatus specifically instead of scanning 1.4MB for keywords");
+}
+
+group("Caption URLs get a PO token, and nothing else gets through");
+{
+  const base = "https://www.youtube.com/api/timedtext?v=dQw4w9WgXcQ&ei=x&caps=asr&opi=1&exp=xpe&xoaf=5&hl=en&ip=0.0.0.0&ipbits=0&expire=1&sparams=ip&signature=AB&key=yt8&lang=en";
+  const built = new URL(buildCaptionUrl(base, "dQw4w9WgXcQ", "TOKEN_123"));
+  check("adds pot, c=WEB and fmt=json3",
+    built.searchParams.get("pot") === "TOKEN_123" && built.searchParams.get("c") === "WEB" && built.searchParams.get("fmt") === "json3",
+    built.search);
+  check("keeps YouTube's signature untouched",
+    built.searchParams.get("signature") === "AB" && built.searchParams.get("exp") === "xpe", built.search);
+  check("replaces an existing fmt instead of duplicating it",
+    new URL(buildCaptionUrl(base + "&fmt=srv3", "dQw4w9WgXcQ", "T")).searchParams.getAll("fmt").join() === "json3");
+  check("no token -> no pot or c param",
+    !/[?&](pot|c)=/.test(buildCaptionUrl(base, "dQw4w9WgXcQ", null)));
+
+  const rejected = [
+    ["another host", "https://evil.example/api/timedtext?v=dQw4w9WgXcQ"],
+    ["a lookalike host", "https://www.youtube.com.evil.example/api/timedtext?v=dQw4w9WgXcQ"],
+    ["plain http", "http://www.youtube.com/api/timedtext?v=dQw4w9WgXcQ"],
+    ["another path", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+    ["another video", "https://www.youtube.com/api/timedtext?v=AAAAAAAAAAA"],
+    ["credentials", "https://u:p@www.youtube.com/api/timedtext?v=dQw4w9WgXcQ"],
+    ["a port", "https://www.youtube.com:8443/api/timedtext?v=dQw4w9WgXcQ"],
+    ["not a string", 42],
+  ];
+  for (const [label, url] of rejected) {
+    check(`rejects ${label}`, buildCaptionUrl(url, "dQw4w9WgXcQ", "T") === null);
+  }
+}
+
+group("BotGuard interpreter only runs from Google");
+{
+  check("accepts the protocol-relative URL YouTube embeds",
+    interpreterUrlFrom("//www.google.com/js/th/nwgAyqBHFFi2W9LKQghwb3A0rEg5C-dyKchYZGE_VuI.js")
+      === "https://www.google.com/js/th/nwgAyqBHFFi2W9LKQghwb3A0rEg5C-dyKchYZGE_VuI.js");
+  for (const [label, url] of [
+    ["another host", "//evil.example/js/th/x.js"],
+    ["a lookalike host", "//www.google.com.evil.example/js/th/x.js"],
+    ["another path on google.com", "//www.google.com/url?q=https://evil.example"],
+    ["plain http", "http://www.google.com/js/th/x.js"],
+    ["a missing value", undefined],
+  ]) {
+    check(`rejects ${label}`, interpreterUrlFrom(url) === null);
+  }
 }
 
 summarise("Units");

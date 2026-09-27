@@ -226,7 +226,7 @@ export default function Studio() {
     setTranscriptMeta(meta);
 
     try {
-      // Fetch actual transcript content from BROWSER (not server)
+      // Load the first working track; the others load when picked.
       setLoadingTranscript(true);
       const allSegments = await fetchAllTranscriptContent(meta.tracks);
       if (version !== contextVersion.current) return;
