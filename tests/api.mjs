@@ -58,6 +58,9 @@ try {
 
     const cases = [
       ["transcript", {}, "videoId is required"],
+      ["captions", {}, "videoId is not a valid"],
+      ["captions", { videoId: "dQw4w9WgXcQ" }, "transcriptUrl must be"],
+      ["captions", { videoId: "dQw4w9WgXcQ", transcriptUrl: "https://example.com/api/timedtext?v=dQw4w9WgXcQ" }, "transcriptUrl must be"],
       ["download", {}, "videoId is required"],
       ["chat", {}, "messages array is required"],
       ["chat", { messages: [] }, "transcriptContext is required"],

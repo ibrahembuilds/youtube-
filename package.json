@@ -19,10 +19,13 @@
     "check": "node scripts/check-video.mjs"
   },
   "dependencies": {
+    "bgutils-js": "^4.0.3",
+    "jsdom": "^26.1.0",
     "lucide-react": "^0.400.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-router-dom": "^6.26.0"
+    "react-router-dom": "^6.26.0",
+    "undici": "^7.30.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.9.0",

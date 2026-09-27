@@ -12,9 +12,8 @@ export default async function handler(req, res) {
   }
 
   try {
-    // Returns track metadata with transcriptUrl for EACH track.
-    // The browser fetches the actual transcript XML from those URLs
-    // (YouTube blocks serverless IPs, but allows requests from real browsers).
+    // Returns track metadata with transcriptUrl for EACH track. The text
+    // itself is fetched one track at a time through /api/captions.
     const result = await fetchAllTranscripts(videoId);
 
     res.json({

@@ -162,15 +162,11 @@ export async function fetchTranscriptMeta(videoId: string): Promise<TranscriptRe
   }
 }
 
-// ─── Client-side transcript fetching ──────────────────────────────────
-// Captions must be fetched from the BROWSER, not the server: YouTube's signed
-// caption URLs return HTTP 200 with an empty body to datacenter IPs (verified
-// against a live signed URL), so anything running on Vercel gets nothing back.
-//
-// Order matters. The direct fetch goes first because YouTube's timedtext API
-// does send CORS headers, and a direct fetch uses the viewer's own IP — which
-// YouTube throttles far less aggressively than a datacenter one. The
-// same-origin proxy is the fallback, then a public CORS proxy as last resort.
+// ─── Transcript fetching ──────────────────────────────────────────────
+// Caption URLs now carry exp=xpe: YouTube answers them with HTTP 200 and an
+// empty body unless the request has a BotGuard PO token (&pot=...&c=WEB).
+// Only the server can mint one, so /api/captions goes first. The browser
+// paths stay as fallbacks for older, tokenless caption URLs.
 
 /** Build a same-origin proxy URL for YouTube's timedtext API. */
 function makeProxyUrl(transcriptUrl: string): string {
@@ -180,6 +176,9 @@ function makeProxyUrl(transcriptUrl: string): string {
   const query = transcriptUrl.substring(qIdx); // includes "?"
   return `/yt-timedtext${query}`;
 }
+
+// The first call on a cold instance also builds the token minter.
+const SERVER_FETCH_TIMEOUT_MS = 30000;
 
 /**
  * Fetch a URL as text. Throws on a non-2xx status, an empty body, or a
@@ -194,11 +193,38 @@ async function fetchText(url: string): Promise<string> {
   return text;
 }
 
-/** Fetch and parse a single transcript track from the browser. */
+/** Fetch one track through the server, which attaches a PO token. */
+async function fetchViaServer(track: TranscriptTrack): Promise<TranscriptSegment[]> {
+  let videoId = "";
+  try {
+    videoId = new URL(track.transcriptUrl).searchParams.get("v") || "";
+  } catch {
+    throw new Error("bad caption URL");
+  }
+  const res = await fetch(`${API_BASE}/captions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ videoId, transcriptUrl: track.transcriptUrl }),
+    signal: AbortSignal.timeout(SERVER_FETCH_TIMEOUT_MS),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.code || `HTTP ${res.status}`);
+  }
+  const data = await res.json();
+  if (typeof data?.body !== "string") throw new Error("malformed response");
+  return parseTranscriptJson3(data.body);
+}
+
+/** Fetch and parse a single transcript track. */
 export async function fetchTranscriptContent(
   track: TranscriptTrack
 ): Promise<TranscriptSegment[]> {
   const sources: { label: string; load: () => Promise<TranscriptSegment[]> }[] = [
+    {
+      label: "server",
+      load: () => fetchViaServer(track),
+    },
     {
       label: "direct",
       load: async () => parseTranscriptXml(await fetchText(track.transcriptUrl)),
@@ -238,19 +264,29 @@ export async function fetchTranscriptContent(
   throw new Error(`Could not load captions for ${track.languageName} — ${failures.join("; ")}`);
 }
 
-/** Fetch transcript content for ALL tracks in parallel from the browser. */
+// Enough to get past one or two broken tracks without spending a request —
+// and proxy bandwidth — on every language a video offers.
+const MAX_INITIAL_TRACK_ATTEMPTS = 3;
+
+/**
+ * Load the first track that works, in order. The rest stay null and load on
+ * demand when the user picks them. Loading every track up front cost one
+ * server request each, which a many-language video turned into a rate-limit
+ * hit before the user had asked for anything.
+ */
 export async function fetchAllTranscriptContent(
   tracks: TranscriptTrack[]
 ): Promise<(TranscriptSegment[] | null)[]> {
-  return Promise.all(
-    tracks.map(async (track) => {
-      try {
-        return await fetchTranscriptContent(track);
-      } catch {
-        return null;
-      }
-    })
-  );
+  const results: (TranscriptSegment[] | null)[] = tracks.map(() => null);
+  for (let i = 0; i < Math.min(tracks.length, MAX_INITIAL_TRACK_ATTEMPTS); i++) {
+    try {
+      results[i] = await fetchTranscriptContent(tracks[i]);
+      break;
+    } catch {
+      // try the next track
+    }
+  }
+  return results;
 }
 
 const XML_ENTITIES: Record<string, string> = {

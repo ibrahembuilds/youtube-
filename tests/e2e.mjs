@@ -46,6 +46,16 @@ const XML = `<?xml version="1.0" encoding="utf-8"?><transcript>
 <text start="65.8" dur="4.1">The first key point is consistency</text>
 <text start="3725.0" dur="2.5">And that is a wrap</text></transcript>`;
 
+const JSON3 = JSON.stringify({ events: [
+  { tStartMs: 500, dDurationMs: 3200, segs: [{ utf8: "Welcome " }, { utf8: "to the show" }] },
+  { tStartMs: 65800, dDurationMs: 4100, segs: [{ utf8: "The first key point is consistency" }] },
+  { tStartMs: 3725000, dDurationMs: 2500, segs: [{ utf8: "And that is a wrap" }] },
+] });
+
+// Caption-text sources, in the order the app should try them. The shared
+// order log also records the metadata lookups (innertube, server-meta).
+const CONTENT_SOURCES = ["server", "direct", "direct-json3", "same-origin-proxy", "cors-proxy"];
+
 const TRACK_URL = "https://www.youtube.com/api/timedtext?v=TEST1234567&lang=en";
 const META = {
   tracks: [{
@@ -77,6 +87,18 @@ function startApi() {
 const api = await startApi();
 const prod = await startProdServer({ port: PORT, apiPort: API_PORT });
 const browser = await chromium.launch(CHROME ? { executablePath: CHROME } : {});
+
+// /api/captions would otherwise reach the real API server and, from there,
+// live YouTube. Every context gets a failing stub by default, so the app falls
+// through to the browser sources those tests control; page-level routes take
+// precedence and override it where a test exercises the server path.
+const newContext = browser.newContext.bind(browser);
+browser.newContext = async (...args) => {
+  const ctx = await newContext(...args);
+  await ctx.route(`${BASE}/api/captions`, (r) =>
+    r.fulfill({ status: 502, contentType: "application/json", body: JSON.stringify({ error: "stubbed", code: "upstream_error" }) }));
+  return ctx;
+};
 
 /**
  * Fresh page with every external host stubbed. `sources` decides what each
@@ -138,6 +160,16 @@ async function newPage({ sources = {} } = {}) {
       return r.fulfill({ status: 429, contentType: "application/json",
         body: JSON.stringify({ error: "YouTube is challenging this server with a bot check.", code: "bot_check" }) });
     return r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(META) });
+  });
+
+  await page.route(`${BASE}/api/captions`, (r) => {
+    order.push("server");
+    const spec = sources.server;
+    if (spec === "hang") return new Promise(() => {});
+    if (typeof spec === "string" && spec.startsWith("{")) {
+      return r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ format: "json3", body: spec }) });
+    }
+    return r.fulfill({ status: 502, contentType: "application/json", body: JSON.stringify({ error: "failed", code: "empty_captions" }) });
   });
 
   page.__order = order;
@@ -242,16 +274,29 @@ try {
 
   group("F01 — source ordering");
   {
-    const { ctx, page } = await newPage({ sources: { direct: XML } });
+    const { ctx, page } = await newPage({ sources: { server: JSON3 } });
     await loadVideo(page);
     // `order` also records the metadata lookup, so filter to the caption
     // sources this group is actually about.
-    const CONTENT = ["direct", "direct-json3", "same-origin-proxy", "cors-proxy"];
-    const contentOrder = page.__order.filter((s) => CONTENT.includes(s));
-    check("tries the direct browser fetch first",
-      contentOrder[0] === "direct",
-      `content sources=${JSON.stringify(contentOrder)} — the viewer's own IP is the least throttled path`);
+    const contentOrder = page.__order.filter((s) => CONTENT_SOURCES.includes(s));
+    check("tries the server (PO token) path first",
+      contentOrder[0] === "server",
+      `content sources=${JSON.stringify(contentOrder)} — exp=xpe caption URLs are empty without a token only the server can mint`);
     check("stops as soon as a source works", contentOrder.length === 1,
+      `content sources=${JSON.stringify(contentOrder)}`);
+    check("renders the server's json3 captions",
+      /Welcome to the show/.test(await transcriptText(page)),
+      `content sources=${JSON.stringify(contentOrder)}`);
+    await ctx.close();
+  }
+  {
+    const { ctx, page } = await newPage({ sources: { direct: XML } });
+    await loadVideo(page);
+    const contentOrder = page.__order.filter((s) => CONTENT_SOURCES.includes(s));
+    check("falls back to the direct browser fetch when the server fails",
+      contentOrder[0] === "server" && contentOrder[1] === "direct",
+      `content sources=${JSON.stringify(contentOrder)} — the viewer's own IP is the least throttled browser path`);
+    check("stops as soon as a source works", contentOrder.length === 2,
       `content sources=${JSON.stringify(contentOrder)}`);
     await ctx.close();
   }
@@ -278,10 +323,9 @@ try {
     const shown = await page.locator("text=Could not load transcript").count();
     check("all sources failing shows an explicit empty state", shown > 0,
       "the user must not be left with a silently blank transcript");
-    const CONTENT = ["direct", "direct-json3", "same-origin-proxy", "cors-proxy"];
-    check("every source was attempted",
-      page.__order.filter((s) => CONTENT.includes(s)).length === 4,
-      `content sources=${JSON.stringify(page.__order.filter((s) => CONTENT.includes(s)))}`);
+    const contentOrder = page.__order.filter((s) => CONTENT_SOURCES.includes(s));
+    check("every source was attempted", contentOrder.length === 5,
+      `content sources=${JSON.stringify(contentOrder)}`);
     await ctx.close();
   }
 

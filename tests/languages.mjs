@@ -49,6 +49,8 @@ for (const L of LANGS) {
         body:JSON.stringify({title:L.name+" test",author_name:"A",author_url:"",thumbnail_url:""})});
       return r.fulfill({status:204,body:""});});
     await page.route(`${BASE}/api/transcript`,r=>r.fulfill({status:200,contentType:"application/json",body:JSON.stringify(META)}));
+    // No API server here: fail the PO-token path so the browser XML source is used.
+    await page.route(`${BASE}/api/captions`,r=>r.fulfill({status:502,contentType:"application/json",body:JSON.stringify({error:"stubbed"})}));
     await page.goto(`${BASE}/studio`,{waitUntil:"domcontentloaded"});
     await page.fill("input[placeholder='Paste YouTube link here...']","dQw4w9WgXcQ");
     await page.click("button:has-text('Load Video')");

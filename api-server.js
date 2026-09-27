@@ -22,7 +22,7 @@ process.env.ALLOWED_ORIGINS = [process.env.ALLOWED_ORIGINS, DEV_ORIGIN]
 const app = express();
 
 // The handlers read the raw request stream themselves, so no body parser here.
-const routes = ["transcript", "translate", "chat", "summary", "viral", "download"];
+const routes = ["transcript", "captions", "translate", "chat", "summary", "viral", "download"];
 
 for (const route of routes) {
   const { default: handler } = await import(`./api/${route}.js`);
