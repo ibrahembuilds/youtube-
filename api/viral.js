@@ -1,4 +1,4 @@
-import { guard, callAI, validateTranscriptContext, MODELS } from "./_lib.js";
+import { guard, sendAIError, callAI, validateTranscriptContext, MODELS } from "./_lib.js";
 
 /**
  * Pull a JSON object out of a model response.
@@ -158,7 +158,6 @@ Before returning, check every clip: if endTime - startTime is under 20 or over
 
     res.json({ shorts });
   } catch (err) {
-    console.error("Viral shorts error:", err.message);
-    res.status(500).json({ error: err.message || "Failed to generate viral shorts" });
+    sendAIError(res, err, "Viral shorts");
   }
 }

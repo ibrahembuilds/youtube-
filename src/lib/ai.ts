@@ -433,24 +433,115 @@ export function transcriptCoverage(segments: TranscriptSegment[]): {
   };
 }
 
+// ─── Timestamps in AI text ───────────────────────────────────────────
+
+const TIMESTAMP_RE = /^(?:(\d+):)?(\d{1,2}):(\d{2})$/;
+
+/** "1:05" → 65, "1:02:05" → 3725. Null for anything that is not a timestamp. */
+export function parseTimestamp(value: string): number | null {
+  const match = TIMESTAMP_RE.exec(value.trim());
+  if (!match) return null;
+  const [, h, m, s] = match;
+  const minutes = Number(m);
+  const seconds = Number(s);
+  if (seconds > 59 || (h !== undefined && minutes > 59)) return null;
+  return Number(h || 0) * 3600 + minutes * 60 + seconds;
+}
+
+/**
+ * Split AI text into plain runs and [m:ss] timestamps, so answers that cite a
+ * moment can seek the player to it. Only bracketed timestamps count; a bare
+ * "3:15" in prose ("a 3:15 pace") is left alone.
+ */
+export function splitTimestamps(text: string): (string | { label: string; seconds: number })[] {
+  const parts: (string | { label: string; seconds: number })[] = [];
+  const re = /\[((?:\d+:)?\d{1,2}:\d{2})\]/g;
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    const seconds = parseTimestamp(match[1]);
+    if (seconds === null) continue;
+    if (match.index > last) parts.push(text.slice(last, match.index));
+    parts.push({ label: match[1], seconds });
+    last = match.index + match[0].length;
+  }
+  if (last < text.length) parts.push(text.slice(last));
+  return parts;
+}
+
+/**
+ * Read a translation back into timestamped rows. The server asks the model to
+ * keep every line's [m:ss] prefix; when most lines did, the translation gets
+ * the same seekable layout as the original. Otherwise null, and the caller
+ * shows the text as a plain paragraph rather than guessing.
+ */
+export function parseTranslatedLines(text: string): TranscriptSegment[] | null {
+  const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
+  if (!lines.length) return null;
+  const rows: TranscriptSegment[] = [];
+  for (const line of lines) {
+    const match = /^\[((?:\d+:)?\d{1,2}:\d{2})\]\s*(.*)$/.exec(line);
+    const seconds = match ? parseTimestamp(match[1]) : null;
+    if (match && seconds !== null && match[2]) {
+      rows.push({ text: match[2], start: seconds, duration: 0 });
+    } else if (rows.length) {
+      // A model occasionally wraps one caption over two lines.
+      rows[rows.length - 1].text += ` ${line}`;
+    }
+  }
+  return rows.length >= Math.ceil(lines.length / 2) ? rows : null;
+}
+
 // ─── Translation ──────────────────────────────────────────────────────
+
+// The server refuses more than 60,000 characters of text per request. Long
+// videos are sent in batches below that, so a two-hour talk translates instead
+// of failing with "too large", and each batch shows up as soon as it is done.
+const TRANSLATE_BATCH_CHARS = 45000;
+
+export function batchSegments(segments: TranscriptSegment[], maxChars = TRANSLATE_BATCH_CHARS): TranscriptSegment[][] {
+  const batches: TranscriptSegment[][] = [];
+  let current: TranscriptSegment[] = [];
+  let size = 0;
+  for (const segment of segments) {
+    if (size + segment.text.length > maxChars && current.length) {
+      batches.push(current);
+      current = [];
+      size = 0;
+    }
+    current.push(segment);
+    size += segment.text.length;
+  }
+  if (current.length) batches.push(current);
+  return batches;
+}
 
 export async function translateTranscript(
   segments: TranscriptSegment[],
-  targetLanguage: string
+  targetLanguage: string,
+  onProgress?: (partialText: string, done: number, total: number) => void
 ): Promise<string> {
-  const res = await fetch(`${API_BASE}/translate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ segments, targetLanguage }),
-    signal: AbortSignal.timeout(65000),
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: "Translation failed" }));
-    throw new Error(err.error || "Translation failed");
+  const batches = batchSegments(segments);
+  const parts: string[] = [];
+  for (const batch of batches) {
+    const res = await fetch(`${API_BASE}/translate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        segments: batch.map((s) => ({ text: s.text, start: s.start })),
+        targetLanguage,
+      }),
+      signal: AbortSignal.timeout(65000),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: "Translation failed" }));
+      throw new Error(err.error || "Translation failed");
+    }
+    const data = await res.json();
+    parts.push(String(data.translatedText ?? ""));
+    if (parts.length < batches.length) onProgress?.(parts.join("\n"), parts.length, batches.length);
   }
-  const data = await res.json();
-  return data.translatedText;
+  return parts.join("\n");
 }
 
 // ─── Chat ─────────────────────────────────────────────────────────────

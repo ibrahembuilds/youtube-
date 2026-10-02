@@ -630,6 +630,74 @@ try {
     await ctx.close();
   }
 
+  group("Workspace flow: links, seeking, errors in context, cached summaries");
+  {
+    const { ctx, page } = await newPage({ sources: { direct: XML } });
+    await page.goto(`${BASE}/studio?v=TEST1234567`, { waitUntil: "domcontentloaded" });
+    await page.waitForFunction(() => document.querySelector("iframe")?.src.includes("TEST1234567"), null, { timeout: 15000 });
+    check("a /studio?v= link opens that video without retyping it", true);
+    await page.getByRole("button", { name: "Transcript", exact: true }).waitFor();
+
+    await loadVideo(page);
+    check("loading a video puts it in the address bar", new URL(page.url()).searchParams.get("v") === "TEST1234567", page.url());
+
+    // Chat errors appear in the tool, and cited timestamps seek the player.
+    await page.route(`${BASE}/api/chat`, (route) => route.fulfill({ status: 503, json: { error: "Provider unavailable" } }));
+    await page.getByRole("button", { name: "Chat", exact: true }).click();
+    await page.getByRole("button", { name: "Key takeaways?", exact: true }).click();
+    await page.getByRole("alert").filter({ hasText: "Provider unavailable" }).waitFor();
+    check("a tool failure is shown inside the tool, not only at the top",
+      await page.locator(".tool-column [role=alert]").filter({ hasText: "Provider unavailable" }).count() === 1);
+    check("a suggested question is sent in one click, and restored on failure",
+      await page.getByLabel("Question about the video").inputValue() === "Key takeaways?");
+    await page.route(`${BASE}/api/chat`, (route) => route.fulfill({ json: { response: "The key point is at [1:05]." } }));
+    await page.getByLabel("Send message").click();
+    await page.locator(".tool-column").getByRole("button", { name: "Seek to 1:05", exact: true }).click();
+    const src = await page.locator("iframe").getAttribute("src");
+    check("a timestamp in a chat answer seeks and plays the video", src.includes("start=65") && src.includes("autoplay=1"), src);
+
+    // Summaries are cached per type.
+    const sent = [];
+    await page.route(`${BASE}/api/summary`, (route) => {
+      const type = JSON.parse(route.request().postData() || "{}").type;
+      sent.push(type);
+      return route.fulfill({ json: { response: `Summary ${type}` } });
+    });
+    await page.getByRole("button", { name: "Summary", exact: true }).click();
+    await page.getByText("Summary brief", { exact: true }).waitFor();
+    await page.getByRole("button", { name: "Detailed", exact: true }).click();
+    await page.getByText("Summary detailed", { exact: true }).waitFor();
+    await page.getByRole("button", { name: "Brief", exact: true }).click();
+    await page.getByText("Summary brief", { exact: true }).waitFor();
+    check("returning to a summary type reuses it instead of paying again", sent.join() === "brief,detailed", sent.join());
+
+    // A translation that kept its timestamps renders as seekable rows.
+    await page.route(`${BASE}/api/translate`, (route) => route.fulfill({ json: { translatedText: "[0:00] Bienvenue\n[1:05] Le premier point\n[1:02:05] Fin" } }));
+    await page.getByRole("button", { name: "Transcript", exact: true }).click();
+    await page.getByRole("button", { name: "Translate", exact: true }).click();
+    await page.getByText("Le premier point", { exact: true }).waitFor();
+    check("translated lines keep their seekable timestamps",
+      await page.getByRole("button", { name: "Seek to 1:02:05", exact: true }).count() === 1);
+
+    // Clip ideas can be played from their start.
+    await page.route(`${BASE}/api/viral`, (route) => route.fulfill({ json: { shorts: [{ title: "Clip", startTime: 30, endTime: 60, script: "s", hook: "h", captions: [], hashtags: [], thumbnailSuggestion: "", reason: "", viralScore: 50 }] } }));
+    await page.getByRole("button", { name: "Viral Shorts", exact: true }).click();
+    await page.getByRole("button", { name: "Play clip from 0:30", exact: true }).click();
+    check("a clip idea plays from its start", (await page.locator("iframe").getAttribute("src")).includes("start=30"));
+    check("no uncaught exceptions in the workspace flow", page.__errors.length === 0, page.__errors.join(" | "));
+    await ctx.close();
+  }
+  {
+    const { ctx, page } = await newPage({
+      sources: { direct: "fail", directJson3: "fail", proxy: "fail", cors: "fail" },
+    });
+    await loadVideo(page);
+    await page.getByRole("alert").filter({ hasText: "could not be downloaded" }).waitFor({ timeout: 15000 });
+    check("captions that list but will not download say so, with a retry",
+      await page.getByRole("button", { name: "Try again", exact: true }).isEnabled());
+    await ctx.close();
+  }
+
   group("Workspace visual checks at 1440, 768, 390, and 320px");
   {
     const { ctx, page } = await newPage({ sources: { direct: XML } });

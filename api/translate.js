@@ -1,4 +1,4 @@
-import { guard, translateTranscript, MAX_TRANSCRIPT_CHARS } from "./_lib.js";
+import { guard, sendAIError, translateTranscript, MAX_TRANSCRIPT_CHARS } from "./_lib.js";
 
 export default async function handler(req, res) {
   const body = await guard(req, res);
@@ -12,6 +12,9 @@ export default async function handler(req, res) {
   if (segments.some((segment) => !segment || typeof segment.text !== "string" || !segment.text.trim())) {
     return res.status(400).json({ error: "Each segment must contain non-empty text" });
   }
+  if (segments.some((segment) => segment.start !== undefined && !Number.isFinite(segment.start))) {
+    return res.status(400).json({ error: "A segment's start must be a number of seconds" });
+  }
   const totalChars = segments.reduce((n, s) => n + String(s?.text ?? "").length, 0);
   if (totalChars > MAX_TRANSCRIPT_CHARS) {
     return res.status(400).json({
@@ -23,7 +26,10 @@ export default async function handler(req, res) {
   }
 
   try {
-    const translatedText = await translateTranscript(segments, targetLanguage);
+    const translatedText = await translateTranscript(
+      segments.map((s) => ({ text: s.text, start: s.start })),
+      targetLanguage
+    );
 
     res.json({
       translatedText,
@@ -31,7 +37,6 @@ export default async function handler(req, res) {
       sourceSegmentCount: segments.length,
     });
   } catch (err) {
-    console.error("Translation error:", err.message);
-    res.status(500).json({ error: err.message || "Translation failed" });
+    sendAIError(res, err, "Translation");
   }
 }

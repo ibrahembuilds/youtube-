@@ -62,8 +62,14 @@ test("AI boundary sends timeout and model payload, validates failures and trunca
       globalThis.fetch = async () => Response.json(fixture);
       await assert.rejects(callAI([]));
     }
+    assert.deepEqual(JSON.parse(captured.body).reasoning, { effort: "low", exclude: true });
     globalThis.fetch = async () => new Response("Unavailable", { status: 503 });
-    await assert.rejects(callAI([]), /AI request failed/);
+    await assert.rejects(callAI([]), { name: "AIError", statusCode: 502 });
+    // A provider body is logged, never shown: it is JSON noise to a viewer.
+    globalThis.fetch = async () => new Response('{"error":{"message":"Insufficient credits on account 123"}}', { status: 402 });
+    await assert.rejects(callAI([]), (err) => err.statusCode === 503 && !/account 123/.test(err.message));
+    globalThis.fetch = async () => { throw new DOMException("timed out", "TimeoutError"); };
+    await assert.rejects(callAI([]), { statusCode: 504 });
   } finally { globalThis.fetch = realFetch; }
 });
 test("long transcript translation retains chunk order", async () => {
@@ -72,6 +78,17 @@ test("long transcript translation retains chunk order", async () => {
       const payload = JSON.parse(options.body); const input = payload.messages.at(-1).content;
       return Response.json({ choices: [{ message: { content: input.startsWith("A") ? "FIRST" : "SECOND" }, finish_reason: "stop" }] });
     };
-    assert.equal(await translateTranscript([{ text: "A".repeat(6000) }, { text: "B".repeat(6000) }], "Arabic"), "FIRST [–––] SECOND");
+    assert.equal(await translateTranscript([{ text: "A".repeat(6000) }, { text: "B".repeat(6000) }], "Arabic"), "FIRST\nSECOND");
+  } finally { globalThis.fetch = realFetch; }
+});
+test("translation sends one timestamped line per caption", async () => {
+  try {
+    let input;
+    globalThis.fetch = async (_url, options) => {
+      input = JSON.parse(options.body).messages.at(-1).content;
+      return Response.json({ choices: [{ message: { content: "[0:05] hola\n[1:02:05] adiós" }, finish_reason: "stop" }] });
+    };
+    assert.equal(await translateTranscript([{ text: "hello", start: 5.4 }, { text: "bye", start: 3725 }], "Spanish"), "[0:05] hola\n[1:02:05] adiós");
+    assert.equal(input, "[0:05] hello\n[1:02:05] bye");
   } finally { globalThis.fetch = realFetch; }
 });
