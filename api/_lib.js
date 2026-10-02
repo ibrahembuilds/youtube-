@@ -26,6 +26,16 @@ export const MODELS = {
   translate: _env.AI_MODEL_TRANSLATE || "openai/gpt-5-mini",
 };
 
+// The gpt-5 tiers reason before answering, at "medium" effort unless told
+// otherwise, and OpenRouter counts those hidden reasoning tokens against
+// max_tokens. At medium, a translation chunk could spend most of its budget
+// thinking and come back cut short; every call also paid for, and waited on,
+// reasoning that reading a transcript does not need. "low" keeps some
+// reasoning for the JSON-shaped viral task without the medium-effort bill.
+// Models that do not reason ignore the parameter.
+// https://openrouter.ai/docs/use-cases/reasoning-tokens
+const REASONING_EFFORT = _env.AI_REASONING_EFFORT || "low";
+
 // ─── Request guard: CORS, method, rate limit, body ────────────────────
 // These endpoints proxy a paid AI provider, so they are only as safe as the
 // gate in front of them. Note what each control actually buys you:
@@ -479,27 +489,7 @@ export async function fetchAllTranscripts(videoId) {
   );
 }
 
-/**
- * Legacy: fetch a single transcript's segments (server-side attempt).
- * Returns empty segments — actual fetching happens client-side now.
- */
-export async function fetchTranscript(videoId) {
-  const { tracks } = await fetchAllTranscripts(videoId);
-  return tracks[0]?.transcriptUrl || "";
-}
-
 // ─── Transcript Formatting ────────────────────────────────────────────
-
-export function formatTranscript(segments, maxChars = 50000) {
-  let result = "";
-  for (const s of segments) {
-    const ts = formatTime(s.start);
-    const line = `[${ts}] ${s.text}\n`;
-    if (result.length + line.length > maxChars) break;
-    result += line;
-  }
-  return result;
-}
 
 export function formatTime(seconds) {
   const h = Math.floor(seconds / 3600);
@@ -512,32 +502,41 @@ export function formatTime(seconds) {
 
 // ─── AI Translation ────────────────────────────────────────────────────
 
+// Small enough that a chunk's translation fits in the output budget even for
+// scripts that cost several tokens per character (Hindi, Thai, Arabic), large
+// enough that a 60k-char transcript is a dozen parallel calls, not fifty.
+const TRANSLATE_CHUNK_CHARS = 5000;
+
+/**
+ * Translate a transcript line by line, keeping each line's [m:ss] timestamp.
+ *
+ * The old version joined every caption into one paragraph, so a translation
+ * came back as a wall of text with no timestamps to seek to, and chunk seams
+ * were marked with a literal "[–––]" the user then saw.
+ */
 export async function translateTranscript(segments, targetLanguage) {
-  if (!_key) throw new Error("API key not configured");
+  if (!_key) throw new AIError("The AI service is not configured on this server.", 503);
 
-  const fullText = segments.map((s) => s.text).join(" ");
-  const maxChunkChars = 8000;
-
-  if (fullText.length <= maxChunkChars) {
-    return await translateChunk(fullText, targetLanguage);
-  }
+  const lines = segments.map((s) =>
+    Number.isFinite(s.start) && s.start >= 0 ? `[${formatTime(s.start)}] ${s.text}` : s.text
+  );
 
   const chunks = [];
-  let currentChunk = "";
-  for (const s of segments) {
-    if (currentChunk.length + s.text.length + 1 > maxChunkChars) {
-      chunks.push(currentChunk.trim());
-      currentChunk = s.text;
-    } else {
-      currentChunk += (currentChunk ? " " : "") + s.text;
+  let current = [];
+  let size = 0;
+  for (const line of lines) {
+    if (size + line.length + 1 > TRANSLATE_CHUNK_CHARS && current.length) {
+      chunks.push(current.join("\n"));
+      current = [];
+      size = 0;
     }
+    current.push(line);
+    size += line.length + 1;
   }
-  if (currentChunk.trim()) chunks.push(currentChunk.trim());
+  if (current.length) chunks.push(current.join("\n"));
 
-  const translatedParts = await Promise.all(
-    chunks.map((chunk) => translateChunk(chunk, targetLanguage))
-  );
-  return translatedParts.join(" [–––] ");
+  const parts = await Promise.all(chunks.map((chunk) => translateChunk(chunk, targetLanguage)));
+  return parts.join("\n");
 }
 
 async function translateChunk(text, targetLanguage) {
@@ -545,19 +544,48 @@ async function translateChunk(text, targetLanguage) {
     [
       {
         role: "system",
-        content: `You are a professional translator. Translate the following text to ${targetLanguage}. Preserve ALL meaning, tone, and nuance. Return ONLY the translated text — no explanations, no notes, no quotation marks.`,
+        content: `You are a professional translator. Translate the user's text to ${targetLanguage}. Preserve meaning, tone, and nuance.
+The text is a video transcript, one caption per line. Keep exactly one output line per input line, in the same order. When a line starts with a timestamp in square brackets such as [1:05], copy that timestamp unchanged at the start of the line and translate only the text after it.
+Return ONLY the translated lines — no explanations, no notes, no quotation marks.`,
       },
       { role: "user", content: text },
     ],
-    { model: MODELS.translate, maxTokens: 4096 }
+    { model: MODELS.translate, maxTokens: 8000 }
   );
   return content.trim();
 }
 
 // ─── AI Chat ───────────────────────────────────────────────────────────
 
+/**
+ * A failure talking to the AI provider, already worded for the user. The raw
+ * provider body goes to the function log, never to the browser — it is JSON
+ * noise to a viewer, and can name the account's plan or credit state.
+ */
+export class AIError extends Error {
+  constructor(message, statusCode = 502) {
+    super(message);
+    this.name = "AIError";
+    this.statusCode = statusCode;
+  }
+}
+
+function providerError(status) {
+  if (status === 402) return new AIError("The AI service is out of credit. Please try again later.", 503);
+  if (status === 429) return new AIError("The AI service is busy right now. Wait a few seconds and try again.", 503);
+  if (status === 401 || status === 403) return new AIError("The AI service is not configured correctly on this server.", 503);
+  return new AIError("The AI service did not answer. Please try again.", 502);
+}
+
+/** Send an AI failure to the client with the right status and a readable message. */
+export function sendAIError(res, err, label) {
+  console.error(`${label}:`, err.message);
+  const status = err instanceof AIError ? err.statusCode : 500;
+  res.status(status).json({ error: err.message || `${label} failed` });
+}
+
 export async function callAI(messages, options = {}) {
-  if (!_key) throw new Error("API key not configured");
+  if (!_key) throw new AIError("The AI service is not configured on this server.", 503);
 
   const {
     model = MODELS.chat,
@@ -566,7 +594,12 @@ export async function callAI(messages, options = {}) {
     json = false,
   } = options;
 
-  const payload = { model, messages, max_tokens: maxTokens };
+  const payload = {
+    model,
+    messages,
+    max_tokens: maxTokens,
+    reasoning: { effort: REASONING_EFFORT, exclude: true },
+  };
 
   // Only send temperature when a caller asks for it. Several models — including
   // every gpt-5 tier — do not accept the parameter at all, so sending it blindly
@@ -578,30 +611,42 @@ export async function callAI(messages, options = {}) {
   // control for structured output, and it works on models where temperature does not.
   if (json) payload.response_format = { type: "json_object" };
 
-  const res = await fetch(OPENROUTER_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${_key}`,
-      "HTTP-Referer": "https://yt-studio.vercel.app",
-      "X-Title": "YT Studio",
-    },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(json || model === MODELS.translate ? 50000 : 25000),
-  });
+  let res;
+  try {
+    res = await fetch(OPENROUTER_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${_key}`,
+        "HTTP-Referer": "https://yt-studio.vercel.app",
+        "X-Title": "YT Studio",
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(json || model === MODELS.translate ? 50000 : 25000),
+    });
+  } catch (err) {
+    if (err?.name === "TimeoutError") {
+      throw new AIError("The AI took too long to answer. Please try again.", 504);
+    }
+    throw new AIError("Could not reach the AI service. Please try again.", 502);
+  }
 
-  if (!res.ok) throw new Error(`AI request failed: ${await res.text()}`);
-  const data = await res.json();
+  if (!res.ok) {
+    console.error(`AI request failed: HTTP ${res.status} ${(await res.text().catch(() => "")).slice(0, 500)}`);
+    throw providerError(res.status);
+  }
+  const data = await res.json().catch(() => null);
 
   // OpenRouter can answer 200 with an error body and no choices — on a
   // moderation block, an upstream provider failure, or exhausted credit.
   // Reading data.choices[0] blindly turns that into a raw TypeError.
   const content = data?.choices?.[0]?.message?.content;
   if (typeof content !== "string" || !content.trim()) {
-    throw new Error(data?.error?.message || "The AI provider returned no completion.");
+    if (data?.error) console.error(`AI provider error: ${JSON.stringify(data.error).slice(0, 500)}`);
+    throw new AIError("The AI service returned no answer. Please try again.", 502);
   }
   if (data.choices[0].finish_reason === "length") {
-    throw new Error("The AI response was cut short. Try a shorter transcript or a briefer request.");
+    throw new AIError("The AI response was cut short. Try a shorter transcript or a briefer request.", 502);
   }
   return content;
 }

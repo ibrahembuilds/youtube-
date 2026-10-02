@@ -5,9 +5,11 @@ Paste a YouTube link. Watch, chat, summarize, and create viral shorts from any v
 ## Features
 
 - 🎬 **Watch** any YouTube video with embedded player
-- 💬 **Chat** with the video — ask any question, get AI answers with timestamps
+- 💬 **Chat** with the video — ask any question, get AI answers whose timestamps jump the player to that moment
 - 📝 **Summarize** — brief, detailed, bullet points, or key takeaways
-- ✂️ **Viral Shorts** — AI finds the best clips, writes scripts, captions, hashtags & thumbnail ideas
+- ✂️ **Viral Shorts** — AI finds the best clips, writes scripts, captions, hashtags & thumbnail ideas; play any clip from its start
+- 🌍 **Translate** — transcripts of any length, line by line, keeping seekable timestamps
+- 🔗 **Shareable workspace** — `/studio?v=VIDEO_ID` opens a video directly, and survives a reload
 - 🕘 **History & Saved** — search and reopen your last 100 videos, with local bookmarks
 - 📥 **Export text** — transcripts, translations, summaries and clip scripts; external tools handle video/audio downloads
 
@@ -40,6 +42,7 @@ History and bookmarks use this browser's localStorage, with no account or cross-
 | `AI_MODEL_SUMMARY` | no | Model for summaries (default `openai/gpt-5-nano`). |
 | `AI_MODEL_VIRAL` | no | Model for viral shorts (default `openai/gpt-5-mini`). |
 | `AI_MODEL_TRANSLATE` | no | Model for translation (default `openai/gpt-5-mini`). |
+| `AI_REASONING_EFFORT` | no | Reasoning effort sent to reasoning models (default `low`; OpenRouter accepts `minimal`, `low`, `medium`, `high`). Reasoning tokens count against each call's `max_tokens`, so higher effort costs more and risks cut-short answers. |
 | `YOUTUBE_PROXY_URL` | yes, in production | Rotating residential proxy for all YouTube requests, e.g. `http://USER-rotate:PASS@p.webshare.io:80`. Without it, Vercel's datacenter IPs get bot-checked and captions fail. |
 | `ALLOWED_ORIGINS` | no | Extra browser origins allowed to call `/api/*`. Same-origin is always allowed. |
 | `RATE_LIMIT_MAX` | no | Per-IP requests per window (default 20). |

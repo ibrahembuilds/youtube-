@@ -1,4 +1,4 @@
-import { guard, callAI, validateTranscriptContext, MODELS } from "./_lib.js";
+import { guard, sendAIError, callAI, validateTranscriptContext, MODELS } from "./_lib.js";
 
 export default async function handler(req, res) {
   const body = await guard(req, res);
@@ -22,7 +22,7 @@ export default async function handler(req, res) {
     const messages = [
       {
         role: "system",
-        content: "You are an expert content summarizer. Create clear, accurate, and well-structured summaries. Detect the language of the transcript and respond in the same language.",
+        content: "You are an expert content summarizer. Create clear, accurate, and well-structured summaries. Detect the language of the transcript and respond in the same language. When a point comes from a specific moment, you may cite its timestamp in square brackets exactly as it appears in the transcript, e.g. [1:05].",
       },
       {
         role: "user",
@@ -33,7 +33,6 @@ export default async function handler(req, res) {
     const response = await callAI(messages, { model: MODELS.summary });
     res.json({ response });
   } catch (err) {
-    console.error("Summary error:", err.message);
-    res.status(500).json({ error: err.message || "Summary failed" });
+    sendAIError(res, err, "Summary");
   }
 }

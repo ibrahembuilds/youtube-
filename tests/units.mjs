@@ -7,6 +7,10 @@ import {
   formatTranscriptText,
   formatTimestamp,
   transcriptCoverage,
+  parseTimestamp,
+  splitTimestamps,
+  parseTranslatedLines,
+  batchSegments,
 } from "../src/lib/ai.ts";
 import {
   extractJsonObject, normaliseShorts, MIN_CLIP_SECONDS, MAX_CLIP_SECONDS,
@@ -308,6 +312,42 @@ group("BotGuard interpreter only runs from Google");
   ]) {
     check(`rejects ${label}`, interpreterUrlFrom(url) === null);
   }
+}
+
+group("Timestamps in AI answers become seek targets");
+{
+  check("m:ss", parseTimestamp("1:05") === 65);
+  check("h:mm:ss", parseTimestamp("1:02:05") === 3725);
+  check("rejects 61 seconds", parseTimestamp("1:61") === null);
+  check("rejects minutes past 59 when hours are present", parseTimestamp("1:75:00") === null);
+  check("rejects prose", parseTimestamp("soon") === null);
+
+  const parts = splitTimestamps("See [1:05] and [1:02:05], not 3:15.");
+  check("splits bracketed timestamps out of prose",
+    JSON.stringify(parts) === JSON.stringify(["See ", { label: "1:05", seconds: 65 }, " and ", { label: "1:02:05", seconds: 3725 }, ", not 3:15."]),
+    JSON.stringify(parts));
+  check("text with no timestamps is one plain run", JSON.stringify(splitTimestamps("plain")) === JSON.stringify(["plain"]));
+  check("an impossible bracketed time stays text",
+    JSON.stringify(splitTimestamps("at [9:99]")) === JSON.stringify(["at [9:99]"]));
+}
+
+group("Translations keep their timestamps");
+{
+  const rows = parseTranslatedLines("[0:00] مرحبا\n[1:05] النقطة الأولى\nتكملة السطر\n[1:02:05] النهاية");
+  check("reads one row per timestamped line", rows?.length === 3, JSON.stringify(rows));
+  check("keeps the start time", rows?.[1].start === 65 && rows?.[2].start === 3725);
+  check("folds a wrapped line into the previous row", rows?.[1].text === "النقطة الأولى تكملة السطر", rows?.[1].text);
+  check("plain prose is not forced into rows", parseTranslatedLines("Un texte sans horodatage.") === null);
+  check("empty text is null", parseTranslatedLines("") === null);
+}
+
+group("Long transcripts translate in batches");
+{
+  const segs = Array.from({ length: 10 }, (_, i) => ({ text: "x".repeat(100), start: i, duration: 1 }));
+  const batches = batchSegments(segs, 250);
+  check("no batch exceeds the limit", batches.every((b) => b.reduce((n, s) => n + s.text.length, 0) <= 250));
+  check("no segment is lost or reordered", batches.flat().map((s) => s.start).join() === segs.map((s) => s.start).join());
+  check("an oversize single segment still gets a batch", batchSegments([{ text: "y".repeat(500), start: 0, duration: 1 }], 250).length === 1);
 }
 
 summarise("Units");
