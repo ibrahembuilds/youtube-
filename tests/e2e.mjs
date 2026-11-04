@@ -568,7 +568,7 @@ try {
     await page.getByRole("button", { name: "Seek to 1:05", exact: true }).click();
     check("timestamp seeks the persistent player", (await page.locator("iframe").getAttribute("src")).includes("start=65"));
     const downloadPromise = page.waitForEvent("download");
-    await page.getByRole("button", { name: "Download text", exact: true }).click();
+    await page.getByRole("button", { name: /Download .+/, exact: false }).click();
     const download = await downloadPromise;
     const path = await download.path();
     const exported = await fs.promises.readFile(path, "utf8");
