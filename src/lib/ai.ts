@@ -35,20 +35,16 @@ export interface TranscriptResult {
 
 // ─── Server API calls ────────────────────────────────────────────────
 
-// ─── Caption lookup, from the browser ──────────────────────────────────
+// ─── Caption lookup ────────────────────────────────────────────────────
 //
-// Measured against the live deployment: 12 of 12 fresh server-side lookups
-// came back as bot_check. YouTube blocks the watch page from datacenter IPs,
-// so the server path is effectively 0% for any video not already cached.
+// Measured 2026-11-04 from a browser on another origin: YouTube answers
+// youtubei/v1/player with HTTP 403 and no Access-Control-Allow-Origin, so the
+// page cannot read it. The server-side iOS player call can, and the caption
+// URLs it returns download without a PO token. The browser call stays as the
+// fallback for when that server lookup is the one being challenged.
 //
-// InnerTube — the same endpoint youtube.com's own player calls — behaves
-// differently in the one way that matters here: it answers cross-origin
-// requests with an Access-Control-Allow-Origin header, which the watch page
-// never does. So the viewer's browser is allowed to call it directly, using
-// the viewer's own residential IP instead of Vercel's.
-//
-// This is tried first and the server endpoint remains the fallback, so a
-// browser that cannot reach it is no worse off than before.
+// text/plain is a CORS-safelisted content type. application/json makes the
+// browser preflight, and YouTube rejects that preflight.
 
 // YouTube's public web-client key. It is embedded in every youtube.com page
 // and identifies the client, not a user — it is not a secret.
@@ -56,6 +52,20 @@ const FETCH_TIMEOUT_MS = 8000;
 
 const INNERTUBE_URL =
   "https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+
+const PLAYER_CLIENTS = [
+  {
+    clientName: "IOS",
+    clientVersion: "20.10.4",
+    deviceMake: "Apple",
+    deviceModel: "iPhone16,2",
+    hl: "en",
+    gl: "US",
+    osName: "iOS",
+    osVersion: "18.1.0",
+  },
+  { clientName: "WEB", clientVersion: "2.20261030.02.00", hl: "en", gl: "US" },
+];
 
 interface InnerTubeCaptionTrack {
   baseUrl?: string;
@@ -65,30 +75,16 @@ interface InnerTubeCaptionTrack {
   name?: { simpleText?: string; runs?: { text?: string }[] };
 }
 
-/** Ask YouTube directly, from the viewer's browser. */
-export async function fetchTranscriptMetaDirect(videoId: string): Promise<TranscriptResult> {
-  const res = await fetch(INNERTUBE_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      context: { client: { clientName: "WEB", clientVersion: "2.20240101.00.00", hl: "en" } },
-      videoId,
-    }),
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-  });
-  if (!res.ok) throw new Error(`InnerTube HTTP ${res.status}`);
+function tracksFromPlayer(data: {
+  playabilityStatus?: { status?: string };
+  captions?: { playerCaptionsTracklistRenderer?: { captionTracks?: InnerTubeCaptionTrack[] } };
+}): TranscriptResult {
+  const status = data?.playabilityStatus?.status;
+  // A challenged player gets the same refusal the server does. Throwing hands
+  // the attempt to the next client, and then to the server's classified error.
+  if (status && status !== "OK") throw new Error(`InnerTube playabilityStatus ${status}`);
 
-  const data = await res.json();
-  const status: string | undefined = data?.playabilityStatus?.status;
-
-  // A browser that is itself being challenged gets the same refusal the server
-  // does. Throwing here hands the attempt to the server fallback.
-  if (status && status !== "OK") {
-    throw new Error(`InnerTube playabilityStatus ${status}`);
-  }
-
-  const raw: InnerTubeCaptionTrack[] =
-    data?.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
+  const raw = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
   if (!raw.length) throw new Error("InnerTube returned no caption tracks");
 
   const tracks: TranscriptTrack[] = raw
@@ -104,8 +100,27 @@ export async function fetchTranscriptMetaDirect(videoId: string): Promise<Transc
     }));
 
   if (!tracks.length) throw new Error("InnerTube tracks carried no urls");
-
   return { tracks, source: "innertube_browser", totalTracks: tracks.length };
+}
+
+/** Ask YouTube directly, from the viewer's browser. Best-effort: often blocked. */
+export async function fetchTranscriptMetaDirect(videoId: string): Promise<TranscriptResult> {
+  let lastError: Error = new Error("InnerTube failed");
+  for (const client of PLAYER_CLIENTS) {
+    try {
+      const res = await fetch(INNERTUBE_URL, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=UTF-8" },
+        body: JSON.stringify({ context: { client }, videoId, contentCheckOk: true, racyCheckOk: true }),
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
+      if (!res.ok) throw new Error(`InnerTube HTTP ${res.status}`);
+      return tracksFromPlayer(await res.json());
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+    }
+  }
+  throw lastError;
 }
 
 /**
@@ -150,15 +165,20 @@ export async function fetchTranscriptMetaFromServer(videoId: string): Promise<Tr
 /**
  * Fetch track metadata (URLs only — no transcript content yet).
  *
- * The browser goes first because it has the viewer's own IP; the server is the
- * fallback. If the browser attempt fails for any reason, the server's error is
- * what surfaces, since it carries the classified code the UI reacts to.
+ * The server goes first. Its player call works from the machines that host
+ * the app, and when it fails the error carries a code the UI can explain.
+ * The browser is the fallback, and only replaces that error when it actually
+ * returns tracks — a CORS failure must not hide the server's reason.
  */
 export async function fetchTranscriptMeta(videoId: string): Promise<TranscriptResult> {
   try {
-    return await fetchTranscriptMetaDirect(videoId);
-  } catch {
     return await fetchTranscriptMetaFromServer(videoId);
+  } catch (serverError) {
+    try {
+      return await fetchTranscriptMetaDirect(videoId);
+    } catch {
+      throw serverError;
+    }
   }
 }
 

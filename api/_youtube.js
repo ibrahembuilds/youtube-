@@ -20,7 +20,7 @@ const _env = typeof process !== "undefined" ? process.env : {};
 // The UA BotGuard sees while minting. Caption requests send the same one so
 // the token and the request describe the same client.
 export const YT_USER_AGENT =
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36(KHTML, like Gecko)";
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 // ─── Proxy ────────────────────────────────────────────────────────────
 
@@ -158,6 +158,12 @@ async function createMinter() {
  * built once per warm instance (about half a second) and reused until its
  * integrity token nears expiry; each mint after that is local.
  */
+/** Drop a minter whose tokens YouTube is rejecting, so the next mint starts clean. */
+export function resetCaptionMinter() {
+  minterPromise = null;
+  minterExpires = 0;
+}
+
 export async function mintCaptionToken(videoId) {
   if (!minterPromise || Date.now() >= minterExpires) {
     minterExpires = Number.POSITIVE_INFINITY; // until createMinter sets the real value

@@ -43,7 +43,7 @@ History and bookmarks use this browser's localStorage, with no account or cross-
 | `AI_MODEL_VIRAL` | no | Model for viral shorts (default `openai/gpt-5-mini`). |
 | `AI_MODEL_TRANSLATE` | no | Model for translation (default `openai/gpt-5-mini`). |
 | `AI_REASONING_EFFORT` | no | Reasoning effort sent to reasoning models (default `low`; OpenRouter accepts `minimal`, `low`, `medium`, `high`). Reasoning tokens count against each call's `max_tokens`, so higher effort costs more and risks cut-short answers. |
-| `YOUTUBE_PROXY_URL` | yes, in production | Rotating residential proxy for all YouTube requests, e.g. `http://USER-rotate:PASS@p.webshare.io:80`. Without it, Vercel's datacenter IPs get bot-checked and captions fail. |
+| `YOUTUBE_PROXY_URL` | when YouTube challenges the server | Rotating residential proxy for YouTube requests, e.g. `http://USER-rotate:PASS@p.webshare.io:80`. Caption lookup uses the iOS player API first, which works from a datacenter IP. Set this when that call starts coming back as a bot check. |
 | `ALLOWED_ORIGINS` | no | Extra browser origins allowed to call `/api/*`. Same-origin is always allowed. |
 | `RATE_LIMIT_MAX` | no | Per-IP requests per window (default 20). |
 | `RATE_LIMIT_WINDOW_MS` | no | Window length in ms (default 60000). |
@@ -54,16 +54,22 @@ if you need a hard cap.
 
 ### How captions are fetched
 
-Two things block a server from reading YouTube captions, and each has its own fix:
+The browser cannot ask YouTube's player API itself. A cross-origin POST to
+`youtubei/v1/player` comes back HTTP 403 with no `Access-Control-Allow-Origin`,
+so the page never sees the caption list. The server asks instead.
 
-1. **PO tokens.** Caption URLs carry `exp=xpe`, and YouTube answers them with
-   HTTP 200 and an empty body unless the request includes `&pot=<token>&c=WEB`.
-   `api/_youtube.js` mints that token with BotGuard (bgutils-js in jsdom), bound
-   to the video id, and `api/captions.js` attaches it. Browser-side fetches
-   cannot do this, so they are only fallbacks.
-2. **IP blocking.** YouTube bot-checks datacenter IPs. Set `YOUTUBE_PROXY_URL`
-   to a rotating residential proxy. Each video costs one watch page (~1.3MB) plus
-   ~50KB per caption track of proxy bandwidth.
+1. **iOS player API.** `api/_lib.js` calls InnerTube with the iOS client. That
+   response is small, still answers from a datacenter IP, and its caption URLs
+   do **not** carry `exp=xpe`, so `/api/captions` downloads them directly.
+2. **Watch page + PO token, as fallback.** If the player call is challenged,
+   the server reads the watch page. Those caption URLs carry `exp=xpe` and
+   YouTube answers them with HTTP 200 and an empty body unless the request
+   includes `&pot=<token>&c=WEB`. `api/_youtube.js` mints that token with
+   BotGuard (bgutils-js in jsdom). A rejected token is minted once more. A
+   URL that does not carry `exp=xpe` is downloaded as-is.
+3. **IP blocking.** If both lookups are bot-checked, set `YOUTUBE_PROXY_URL`
+   to a rotating residential proxy. The player call is the one that normally
+   runs, so a video costs one small player response plus one caption file.
 
 ## Tests
 

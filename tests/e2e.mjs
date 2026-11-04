@@ -159,6 +159,7 @@ async function newPage({ sources = {} } = {}) {
     if (spec === "bot_check")
       return r.fulfill({ status: 429, contentType: "application/json",
         body: JSON.stringify({ error: "YouTube is challenging this server with a bot check.", code: "bot_check" }) });
+    if (spec === "fail") return r.fulfill({ status: 500, contentType: "application/json", body: "" });
     return r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(META) });
   });
 
@@ -194,34 +195,36 @@ const transcriptText = (page) =>
   page.locator(".card.p-6 .overflow-y-auto").first().textContent().catch(() => "");
 
 try {
-  group("Caption lookup asks the browser before the server");
+  group("Caption lookup asks the server, then the browser");
   {
-    // Measured against the live deployment: 12 of 12 fresh server-side lookups
-    // returned bot_check, because YouTube blocks the watch page from datacenter
-    // IPs. InnerTube answers cross-origin, so the viewer's own IP can be used.
+    // Measured 2026-11-04: a browser POST to youtubei/v1/player is HTTP 403
+    // with no Access-Control-Allow-Origin, so the page cannot read it. The
+    // server's iOS player call can, and its caption URLs download without a
+    // PO token. The browser is only the fallback.
     const a = await newPage({ sources: { innertube: "ok", direct: XML } });
     await loadVideo(a.page);
-    check("the browser asks YouTube directly first",
-      a.page.__order[0] === "innertube", `order=${JSON.stringify(a.page.__order)}`);
-    check("and never touches the server endpoint when that works",
-      !a.page.__order.includes("server-meta"), `order=${JSON.stringify(a.page.__order)}`);
+    check("the app asks our server before YouTube in the browser",
+      a.page.__order[0] === "server-meta", `order=${JSON.stringify(a.page.__order)}`);
+    check("and does not call YouTube from the browser when the server works",
+      !a.page.__order.includes("innertube"), `order=${JSON.stringify(a.page.__order)}`);
     check("the transcript still renders",
       /Welcome to the show/.test(await transcriptText(a.page)));
     await a.ctx.close();
 
-    // A browser that is itself challenged must not dead-end.
-    const b = await newPage({ sources: { innertube: "blocked", direct: XML } });
+    // A server that is itself challenged must not dead-end while the browser
+    // can still read the player response.
+    const b = await newPage({ sources: { innertube: "ok", serverMeta: "bot_check", direct: XML } });
     await loadVideo(b.page);
-    check("a challenged browser falls back to the server",
-      b.page.__order.includes("server-meta"), `order=${JSON.stringify(b.page.__order)}`);
+    check("a challenged server falls back to the browser",
+      b.page.__order.includes("innertube"), `order=${JSON.stringify(b.page.__order)}`);
     check("and the transcript still renders",
       /Welcome to the show/.test(await transcriptText(b.page)));
     await b.ctx.close();
 
-    const c = await newPage({ sources: { innertube: "fail", direct: XML } });
+    const c = await newPage({ sources: { innertube: "fail", serverMeta: "fail", direct: XML } });
     await loadVideo(c.page);
-    check("a network failure also falls back",
-      c.page.__order.includes("server-meta"), `order=${JSON.stringify(c.page.__order)}`);
+    check("a server failure also tries the browser",
+      c.page.__order.includes("innertube"), `order=${JSON.stringify(c.page.__order)}`);
     await c.ctx.close();
   }
 

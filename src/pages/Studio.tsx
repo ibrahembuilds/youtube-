@@ -478,9 +478,18 @@ export default function Studio() {
           <div className="flex items-center gap-3">
             {transcriptMeta && (trackSegments.size > 0 || loadingTranscript) && (
               <div className="badge bg-green-50 text-green-600">
-                <CheckCircle className="w-3 h-3" />
-                {trackSegments.size} transcript{trackSegments.size !== 1 ? "s" : ""} ready
-                {loadingTranscript && <Loader2 className="w-3 h-3 animate-spin ml-1" />}
+                {loadingTranscript && trackSegments.size === 0 ? (
+                  <>
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    Loading transcript
+                  </>
+                ) : (
+                  <>
+                    <CheckCircle className="w-3 h-3" />
+                    {trackSegments.size} transcript{trackSegments.size !== 1 ? "s" : ""} ready
+                    {loadingTranscript && <Loader2 className="w-3 h-3 animate-spin ml-1" />}
+                  </>
+                )}
               </div>
             )}
           </div>

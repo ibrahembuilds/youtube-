@@ -1,5 +1,5 @@
 import { guard } from "./_lib.js";
-import { youtubeFetch, mintCaptionToken, YT_USER_AGENT } from "./_youtube.js";
+import { youtubeFetch, mintCaptionToken, resetCaptionMinter, YT_USER_AGENT } from "./_youtube.js";
 
 // Vercel caps a function response at 4.5MB. A long video's json3 is well
 // under 1MB; anything near the cap is not a caption file.
@@ -33,6 +33,30 @@ export function buildCaptionUrl(transcriptUrl, videoId, poToken) {
   return url.href;
 }
 
+/** exp=xpe caption URLs are empty unless a PO token is attached. Others download as-is. */
+export function captionUrlNeedsPoToken(transcriptUrl) {
+  try {
+    return new URL(transcriptUrl).searchParams.get("exp") === "xpe";
+  } catch {
+    return false;
+  }
+}
+
+async function pullCaption(videoId, transcriptUrl, poToken) {
+  let upstream;
+  try {
+    upstream = await youtubeFetch(buildCaptionUrl(transcriptUrl, videoId, poToken), {
+      headers: { "User-Agent": YT_USER_AGENT, "Accept-Language": "en-US,en;q=0.9" },
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch (err) {
+    return { error: "reach", detail: err.message };
+  }
+  if (upstream.status === 429 || upstream.status === 403) return { error: "throttled" };
+  if (!upstream.ok) return { error: "status", status: upstream.status };
+  return { text: await upstream.text() };
+}
+
 export default async function handler(req, res) {
   const body = await guard(req, res);
   if (!body) return;
@@ -46,34 +70,44 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "transcriptUrl must be this video's YouTube caption URL" });
   }
 
-  // A caption URL without exp=xpe still works tokenless, so a minting failure
-  // is logged and the request goes ahead rather than failing outright.
+  // Only exp=xpe URLs need a PO token. The iOS player hands back URLs
+  // without that flag, and those download as-is. A URL that still needs a
+  // token is retried once with a fresh minter — a warm instance can cache
+  // a minter whose tokens YouTube has started rejecting.
+  const needsPot = captionUrlNeedsPoToken(transcriptUrl);
   let poToken = null;
-  try {
-    poToken = await mintCaptionToken(videoId);
-  } catch (err) {
-    console.error(`PO token mint failed for ${videoId}: ${err.message}`);
+  if (needsPot) {
+    try {
+      poToken = await mintCaptionToken(videoId);
+    } catch (err) {
+      console.error(`PO token mint failed for ${videoId}: ${err.message}`);
+    }
   }
 
-  let upstream;
-  try {
-    upstream = await youtubeFetch(buildCaptionUrl(transcriptUrl, videoId, poToken), {
-      headers: { "User-Agent": YT_USER_AGENT, "Accept-Language": "en-US,en;q=0.9" },
-      signal: AbortSignal.timeout(15000),
-    });
-  } catch (err) {
-    console.error(`Caption fetch failed for ${videoId}: ${err.message}`);
+  let result = await pullCaption(videoId, transcriptUrl, poToken);
+  if (needsPot && result.text !== undefined && !result.text.trim()) {
+    console.error(`Empty caption body for ${videoId} (token ${poToken ? "sent" : "missing"}), minting again`);
+    resetCaptionMinter();
+    try {
+      poToken = await mintCaptionToken(videoId);
+      result = await pullCaption(videoId, transcriptUrl, poToken);
+    } catch (err) {
+      console.error(`PO token remint failed for ${videoId}: ${err.message}`);
+    }
+  }
+
+  if (result.error === "reach") {
+    console.error(`Caption fetch failed for ${videoId}: ${result.detail}`);
     return res.status(502).json({ error: "Could not reach YouTube for this caption track.", code: "upstream_error" });
   }
-
-  if (upstream.status === 429 || upstream.status === 403) {
+  if (result.error === "throttled") {
     return res.status(429).json({ error: "YouTube is rate-limiting caption requests. Try again shortly.", code: "throttled" });
   }
-  if (!upstream.ok) {
-    return res.status(502).json({ error: `YouTube returned HTTP ${upstream.status} for this caption track.`, code: "upstream_error" });
+  if (result.error === "status") {
+    return res.status(502).json({ error: `YouTube returned HTTP ${result.status} for this caption track.`, code: "upstream_error" });
   }
 
-  const text = await upstream.text();
+  const text = result.text || "";
   if (!text.trim()) {
     // The exp=xpe signature: 200 with nothing in it. Saying so here is what
     // separates "token rejected" from "no captions" in the logs.
