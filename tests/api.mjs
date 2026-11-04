@@ -187,6 +187,14 @@ try {
       check("the message says it is YouTube, not the video",
         /rate-limit/i.test(r.json.error) && !/has none/i.test(r.json.error),
         `message: ${r.json.error}`);
+    } else if (r.json?.code === "bot_check") {
+      check("a bot check reports 429, separately from 'no captions'",
+        r.status === 429, `got ${r.status}`);
+      check("a bot check tells the client when to retry",
+        !!r.headers.get("retry-after"), `Retry-After=${r.headers.get("retry-after")}`);
+      check("the message says it is the server, not the video",
+        /bot check/i.test(r.json.error) && !/has no captions/i.test(r.json.error),
+        `message: ${r.json.error}`);
     } else {
       check("a non-throttle failure is still classified",
         ["no_captions", "unavailable", "upstream_error"].includes(r.json?.code),

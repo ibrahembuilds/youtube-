@@ -250,7 +250,7 @@ function mapCaptionTracks(tracksJson) {
       t.name?.simpleText || t.name?.runs?.[0]?.text || t.languageCode || "Unknown",
     kind: t.kind || "unknown",
     isTranslatable: t.isTranslatable || false,
-    // Fetched by /api/captions with a PO token; the browser paths are fallbacks.
+    // /api/captions downloads this. URLs without exp=xpe need no PO token.
     transcriptUrl: t.baseUrl,
     translationLanguages: (t.translationLanguages || []).map((tl) => ({
       languageCode: tl.languageCode,
@@ -414,49 +414,132 @@ async function fetchCaptionsFromWatchPage(videoId) {
   return classifyWatchPage(res.status, html);
 }
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// The public web-client key embedded in every youtube.com page. It identifies
+// the client, not a user.
+const INNERTUBE_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+
+// The WEB player, called from a server, answers UNPLAYABLE / "Video unavailable"
+// for public videos, and its caption URLs carry exp=xpe (empty without a PO
+// token). The iOS player still returns playable caption URLs without that
+// flag, including from a datacenter IP. Measured 2026-11-04.
+const INNERTUBE_CLIENTS = [
+  {
+    userAgent: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_1 like Mac OS X)",
+    client: {
+      clientName: "IOS",
+      clientVersion: "20.10.4",
+      deviceMake: "Apple",
+      deviceModel: "iPhone16,2",
+      hl: "en",
+      gl: "US",
+      osName: "iOS",
+      osVersion: "18.1.0",
+    },
+  },
+];
 
 /**
- * Fetch caption track metadata for a video.
- *
- * Retries only outcomes a retry could fix, and backs off between attempts —
- * the old version fired two identical requests back to back, which is the
- * worst possible move when the reason for failure is rate limiting.
+ * Decide what an InnerTube player response means. Same outcome vocabulary as
+ * classifyWatchPage, so the caller can treat the two lookups alike.
  */
-export async function fetchAllTranscripts(videoId) {
-  const cached = cacheGet(videoId);
-  if (cached) return { ...cached, cached: true };
+export function classifyPlayerResponse(data) {
+  if (!data || typeof data !== "object") {
+    return { kind: "transient", detail: "player response was not JSON" };
+  }
+  const status = data.playabilityStatus?.status;
+  const reason = typeof data.playabilityStatus?.reason === "string" ? data.playabilityStatus.reason : null;
+  if (!status) return { kind: "transient", detail: "player response had no playability status" };
 
-  const backoffMs = [0, 700, 2000];
-  let last = null;
-
-  for (const wait of backoffMs) {
-    if (wait) await sleep(wait);
-    last = await fetchCaptionsFromWatchPage(videoId);
-
-    if (last.kind === "ok") {
-      const value = { tracks: last.tracks, source: "youtube_page_urls" };
-      cacheSet(videoId, value);
-      return value;
+  if (status === "LOGIN_REQUIRED") {
+    if (!reason || /not a bot|sign in to confirm|unusual traffic/i.test(reason)) {
+      return { kind: "blocked", detail: reason || "YouTube bot check" };
     }
-    // Retrying will not conjure captions that do not exist, and will not
-    // un-private a video.
-    if (last.kind === "none" || last.kind === "unavailable") break;
+    return {
+      kind: "unavailable",
+      detail: `YouTube says: "${reason}" — the video is private or needs sign-in.`,
+    };
   }
 
-  if (last.kind === "none") {
-    throw new TranscriptError(
-      "no_captions",
-      "This video has no captions, so there is nothing to transcribe, chat with or summarise. Try a video that shows a CC badge on YouTube.",
-      422
-    );
+  if (/page needs to be reloaded|unusual traffic|not a bot/i.test(reason || "")) {
+    return { kind: "blocked", detail: reason };
   }
 
-  if (last.kind === "unavailable") {
-    throw new TranscriptError("unavailable", last.detail, 422);
+  if (status === "AGE_VERIFICATION_REQUIRED" || status === "CONTENT_CHECK_REQUIRED") {
+    return {
+      kind: "unavailable",
+      detail: reason || "That video is age-restricted, so its captions cannot be read.",
+    };
   }
 
-  if ((last.kind === "blocked" || last.kind === "throttled") && !hasYoutubeProxy()) {
+  if (status === "UNPLAYABLE" || status === "ERROR") {
+    return {
+      kind: "unavailable",
+      detail: reason ? `YouTube says: "${reason}"` : "That video is unavailable.",
+    };
+  }
+
+  if (status !== "OK" && status !== "LIVE_STREAM_OFFLINE") {
+    return { kind: "transient", detail: `playabilityStatus ${status}` };
+  }
+
+  const raw = data.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+  if (!Array.isArray(raw) || raw.length === 0) return { kind: "none" };
+
+  const tracks = mapCaptionTracks(raw).filter(
+    (track) => typeof track.transcriptUrl === "string" && track.transcriptUrl.startsWith("https://www.youtube.com/api/timedtext")
+  );
+  if (!tracks.length) return { kind: "none" };
+  return { kind: "ok", tracks };
+}
+
+async function fetchCaptionsFromInnertube(videoId) {
+  let last = { kind: "transient", detail: "no player client attempted" };
+  for (const spec of INNERTUBE_CLIENTS) {
+    let res;
+    try {
+      res = await youtubeFetch(
+        `https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_API_KEY}&prettyPrint=false`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "User-Agent": spec.userAgent,
+            "Accept-Language": "en-US,en;q=0.9",
+          },
+          body: JSON.stringify({
+            context: { client: spec.client },
+            videoId,
+            contentCheckOk: true,
+            racyCheckOk: true,
+          }),
+          signal: AbortSignal.timeout(15000),
+        }
+      );
+    } catch (err) {
+      last = { kind: "transient", detail: `request failed: ${err.message}` };
+      continue;
+    }
+    if (res.status === 429 || res.status === 403) {
+      last = { kind: "throttled", detail: `YouTube returned HTTP ${res.status}` };
+      continue;
+    }
+    if (res.status !== 200) {
+      last = { kind: "transient", detail: `YouTube returned HTTP ${res.status}` };
+      continue;
+    }
+    try {
+      last = classifyPlayerResponse(await res.json());
+    } catch {
+      last = { kind: "transient", detail: "player response was not JSON" };
+      continue;
+    }
+    if (last.kind === "ok" || last.kind === "none" || last.kind === "unavailable") return last;
+  }
+  return last;
+}
+
+function throwTranscriptFailure(last) {
+  if ((last?.kind === "blocked" || last?.kind === "throttled") && !hasYoutubeProxy()) {
     // For the operator, not the user: this is the misconfiguration to fix.
     console.error(
       "YouTube is blocking this server's IP and YOUTUBE_PROXY_URL is not set. " +
@@ -464,7 +547,19 @@ export async function fetchAllTranscripts(videoId) {
     );
   }
 
-  if (last.kind === "blocked") {
+  if (last?.kind === "none") {
+    throw new TranscriptError(
+      "no_captions",
+      "This video has no captions, so there is nothing to transcribe, chat with or summarise. Try a video that shows a CC badge on YouTube.",
+      422
+    );
+  }
+
+  if (last?.kind === "unavailable") {
+    throw new TranscriptError("unavailable", last.detail, 422);
+  }
+
+  if (last?.kind === "blocked") {
     throw new TranscriptError(
       "bot_check",
       "YouTube is challenging this server with a bot check, so it will not hand over the caption list. This is not a problem with the video — it happens because the request comes from a datacenter IP. Try again shortly; if it keeps happening, this video's captions cannot be read from the server.",
@@ -473,7 +568,7 @@ export async function fetchAllTranscripts(videoId) {
     );
   }
 
-  if (last.kind === "throttled") {
+  if (last?.kind === "throttled") {
     throw new TranscriptError(
       "throttled",
       "YouTube is rate-limiting this server right now — this is not a problem with the video. Wait about a minute and try again.",
@@ -487,6 +582,40 @@ export async function fetchAllTranscripts(videoId) {
     `Could not reach YouTube to look up captions (${last?.detail || "unknown error"}). Try again in a moment.`,
     502
   );
+}
+
+/**
+ * Fetch caption track metadata for a video.
+ *
+ * The iOS player API is asked first: one small response, and caption URLs
+ * that download without a PO token. The watch page is a single fallback for
+ * when that player call is challenged — one attempt, not a retry loop, because
+ * repeating a request YouTube just refused is what gets the IP banned.
+ */
+export async function fetchAllTranscripts(videoId) {
+  const cached = cacheGet(videoId);
+  if (cached) return { ...cached, cached: true };
+
+  const innertube = await fetchCaptionsFromInnertube(videoId);
+  if (innertube.kind === "ok") {
+    const value = { tracks: innertube.tracks, source: "youtube_innertube" };
+    cacheSet(videoId, value);
+    return value;
+  }
+  // "no captions" and "unavailable" are facts about the video. A challenged
+  // or broken player call is not, so only those fall through to the watch page.
+  if (innertube.kind === "none" || innertube.kind === "unavailable") {
+    throwTranscriptFailure(innertube);
+  }
+
+  const page = await fetchCaptionsFromWatchPage(videoId);
+  if (page.kind === "ok") {
+    const value = { tracks: page.tracks, source: "youtube_page_urls" };
+    cacheSet(videoId, value);
+    return value;
+  }
+  // Prefer a definite answer from the player over a vaguer page failure.
+  throwTranscriptFailure(page.kind === "transient" && innertube.kind !== "transient" ? innertube : page);
 }
 
 // ─── Transcript Formatting ────────────────────────────────────────────

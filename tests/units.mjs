@@ -15,8 +15,8 @@ import {
 import {
   extractJsonObject, normaliseShorts, MIN_CLIP_SECONDS, MAX_CLIP_SECONDS,
 } from "../api/viral.js";
-import { classifyWatchPage } from "../api/_lib.js";
-import { buildCaptionUrl } from "../api/captions.js";
+import { classifyWatchPage, classifyPlayerResponse } from "../api/_lib.js";
+import { buildCaptionUrl, captionUrlNeedsPoToken } from "../api/captions.js";
 import { interpreterUrlFrom } from "../api/_youtube.js";
 
 group("XML caption parsing");
@@ -269,6 +269,41 @@ group("Watch-page classification (F08 decision table)");
     "reads playabilityStatus specifically instead of scanning 1.4MB for keywords");
 }
 
+group("Player-response classification");
+{
+  const track = (extra) => ({
+    baseUrl: "https://www.youtube.com/api/timedtext?v=dQw4w9WgXcQ&lang=en",
+    languageCode: "en",
+    isTranslatable: true,
+    ...extra,
+  });
+  const ok = classifyPlayerResponse({
+    playabilityStatus: { status: "OK" },
+    captions: { playerCaptionsTracklistRenderer: { captionTracks: [
+      track({ name: { runs: [{ text: "English" }] } }),
+      track({ kind: "asr", name: { simpleText: "English (auto-generated)" }, baseUrl: "https://www.youtube.com/api/timedtext?v=dQw4w9WgXcQ&lang=en&kind=asr" }),
+      { languageCode: "de", name: { simpleText: "German" } },
+    ] } },
+  });
+  check("OK with tracks -> ok", ok.kind === "ok" && ok.tracks.length === 2, JSON.stringify(ok.tracks?.map((t) => t.languageName)));
+  check("reads a name made of runs", ok.tracks?.[0].languageName === "English");
+  check("keeps an asr track's kind", ok.tracks?.[1].kind === "asr");
+  check("drops a track with no caption url", ok.tracks?.every((t) => t.transcriptUrl.startsWith("https://www.youtube.com/api/timedtext")));
+
+  check("OK with no tracks -> none",
+    classifyPlayerResponse({ playabilityStatus: { status: "OK" }, captions: {} }).kind === "none");
+  check("LOGIN_REQUIRED + bot reason -> blocked",
+    classifyPlayerResponse({ playabilityStatus: { status: "LOGIN_REQUIRED", reason: "Sign in to confirm you're not a bot" } }).kind === "blocked");
+  check("LOGIN_REQUIRED + a real reason -> unavailable",
+    classifyPlayerResponse({ playabilityStatus: { status: "LOGIN_REQUIRED", reason: "This video is private" } }).kind === "unavailable");
+  check("ERROR + YouTube's wording -> unavailable",
+    classifyPlayerResponse({ playabilityStatus: { status: "ERROR", reason: "This video is unavailable" } }).kind === "unavailable");
+  check("'page needs to be reloaded' -> blocked",
+    classifyPlayerResponse({ playabilityStatus: { status: "UNPLAYABLE", reason: "The page needs to be reloaded." } }).kind === "blocked");
+  check("a non-object -> transient", classifyPlayerResponse(null).kind === "transient");
+  check("missing playability -> transient", classifyPlayerResponse({}).kind === "transient");
+}
+
 group("Caption URLs get a PO token, and nothing else gets through");
 {
   const base = "https://www.youtube.com/api/timedtext?v=dQw4w9WgXcQ&ei=x&caps=asr&opi=1&exp=xpe&xoaf=5&hl=en&ip=0.0.0.0&ipbits=0&expire=1&sparams=ip&signature=AB&key=yt8&lang=en";
@@ -282,6 +317,10 @@ group("Caption URLs get a PO token, and nothing else gets through");
     new URL(buildCaptionUrl(base + "&fmt=srv3", "dQw4w9WgXcQ", "T")).searchParams.getAll("fmt").join() === "json3");
   check("no token -> no pot or c param",
     !/[?&](pot|c)=/.test(buildCaptionUrl(base, "dQw4w9WgXcQ", null)));
+  check("exp=xpe needs a PO token", captionUrlNeedsPoToken(base) === true);
+  check("a tokenless player url does not need a PO token",
+    captionUrlNeedsPoToken("https://www.youtube.com/api/timedtext?v=dQw4w9WgXcQ&lang=en") === false);
+  check("a nonsense url does not need a PO token", captionUrlNeedsPoToken("not a url") === false);
 
   const rejected = [
     ["another host", "https://evil.example/api/timedtext?v=dQw4w9WgXcQ"],
