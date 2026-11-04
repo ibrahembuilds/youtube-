@@ -48,6 +48,12 @@ function baseCode(code: string | undefined): string {
   return (code || "").toLowerCase().split(/[-_]/)[0];
 }
 
+/** Keep each chosen language in its own file, so Spanish does not overwrite Arabic. */
+function transcriptFilename(language: string): string {
+  const slug = language.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "transcript";
+  return `yt-studio-transcript-${slug}.txt`;
+}
+
 /** The language the viewer most likely wants, that is not the transcript's own. */
 function defaultTargetLanguage(trackCode: string | undefined): string {
   const track = baseCode(trackCode);
@@ -795,7 +801,11 @@ function TranscriptTab({
         )}
       </div>
       <div className="card p-6">
-        <ExportText text={translatedText || segments.map((segment) => `[${formatTimestamp(segment.start)}] ${segment.text}`).join("\n")} filename="yt-studio-transcript.txt" />
+        <ExportText
+          text={translatedText || segments.map((segment) => `[${formatTimestamp(segment.start)}] ${segment.text}`).join("\n")}
+          filename={transcriptFilename(translatedText ? targetLanguage : (track.languageCode || track.languageName))}
+          downloadLabel={`Download ${translatedText ? targetLanguage : track.languageName}`}
+        />
         {!translatedText && <input aria-label="Search transcript" className="input mb-4 text-sm" placeholder="Find a word or moment…" value={search} onChange={(event) => setSearch(event.target.value)} />}
         {!translatedText && search && <p className="text-xs text-ink-600 mb-3">{visibleSegments.length} matching segments</p>}
         <div className="max-h-[600px] overflow-y-auto">
